@@ -1,0 +1,74 @@
+seed: 1337
+
+data:
+  train_csv: data/train.csv
+  labels_csv: data/train_labels.csv
+  test_csv: data/test.csv
+  target_pairs_csv: data/target_pairs.csv
+  date_column: date_id
+  window: 512
+  patch_len: 16
+  patch_stride: 8
+  features: null  # null => use all numeric cols except date_id
+  channels_first: false
+  normalize_per_day: true
+  winsorize_p: 0.005
+
+model:
+  d_model: 640
+  n_heads: 10
+  dropout: 0.1
+  n_layers_intra: 10
+  n_layers_cross: 6
+  activation: gelu
+  time2vec_dim: 8
+  use_flash_attn: true
+  use_compile: true
+  cross_group_size: 0  # >0 启用跨资产分组注意力（每组大小），避免 token 爆炸
+
+train:
+  epochs: 30
+  batch_days: 8  # number of days per batch (assets form the second dimension)
+  grad_accum: 1
+  lr_max: 0.0015
+  weight_decay: 0.05
+  warmup_pct: 0.08
+  amp: true
+  grad_clip_norm: 1.0
+  checkpoint_dir: checkpoints
+  save_every: 1
+  early_stop_patience: 5
+  grad_checkpointing: false
+  use_pretrain: false
+  pretrain_ckpt: checkpoints/timae_encoder.ckpt
+
+loss:
+  diffsort_temperature: 0.1
+  diffsort_regularization: none  # sinkhorn|l2|none (torchsort)
+  stability_lambda: 0.2
+
+cv:
+  n_splits: 5
+  embargo_days: 4
+  test_size_fraction: 0.2
+  max_train_dates: null
+  use_cpcv: true
+
+inference:
+  snapshot: checkpoints/best.ckpt
+  tanh_clip: 0.0
+
+pretrain:
+  epochs: 10
+  lr: 0.001
+  weight_decay: 0.05
+  mask_ratio: 0.5
+  batch_days: 16
+  window: 512
+  patch_len: 16
+  patch_stride: 8
+  time2vec_dim: 8
+
+logging:
+  log_dir: runs/camht
+  csv_log: runs/metrics.csv
