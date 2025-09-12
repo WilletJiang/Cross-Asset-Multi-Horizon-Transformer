@@ -38,8 +38,8 @@ train:
   checkpoint_dir: checkpoints
   save_every: 1
   early_stop_patience: 5
-  grad_checkpointing: false
-  use_pretrain: false
+  grad_checkpointing: true
+  use_pretrain: true
   pretrain_ckpt: checkpoints/timae_encoder.ckpt
 
 loss:
