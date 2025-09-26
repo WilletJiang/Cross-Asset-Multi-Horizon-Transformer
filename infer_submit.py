@@ -3,42 +3,16 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import os
-from typing import List
 
 import numpy as np
 import pandas as pd
 import polars as pl
 import torch
 
+from camht.data import build_normalized_windows
 from camht.model import CAMHT
 from camht.targets import TargetDef, compute_target_matrix, parse_target_pairs
 from camht.utils import SDPPolicy, configure_sdp, get_device
-
-
-def _prepare_daily_window(series_df: pl.DataFrame, date_col: str, window: int) -> np.ndarray:
-    series_df = series_df.sort(date_col)
-    # last `window` rows
-    sub = series_df[-window:]
-    X = sub.drop([date_col]).to_numpy()  # [T, A]
-    mu = X.mean(axis=0, keepdims=True)
-    sd = X.std(axis=0, keepdims=True) + 1e-8
-    X = (X - mu) / sd
-    X = np.expand_dims(X.T, -1)  # [A, T, 1]
-    return X
-
-
-def predict_one_day(model: CAMHT, series_df: pl.DataFrame, date_id: int, date_col: str, window: int) -> np.ndarray:
-    X = _prepare_daily_window(series_df.filter(pl.col(date_col) <= date_id), date_col, window)
-    T = X.shape[1]
-    times = np.linspace(0, 1, T, dtype=np.float32)[None, :, None].repeat(X.shape[0], axis=0)
-    device = next(model.parameters()).device
-    with torch.no_grad():
-        preds = model(
-            torch.from_numpy(X).unsqueeze(0).to(device),  # [1, A, T, 1]
-            torch.from_numpy(times).unsqueeze(0).to(device),  # [1, A, T, 1]
-        )  # list of [1, A]
-        preds = [p.squeeze(0).float().cpu().numpy() for p in preds]
-    return preds  # list of [A]
 
 
 def main():
@@ -77,29 +51,37 @@ def main():
     defs = parse_target_pairs(args.target_pairs)
     series_df, order = compute_target_matrix(test, args.date_col, defs)
 
-    predictions = []
-    for date_id in series_df[args.date_col].unique(maintain_order=True).to_list():
-        preds_list = predict_one_day(model, series_df, int(date_id), args.date_col, args.window)
-        # day-level standardization across assets to stabilize ranks
-        std_preds_list = []
-        for p in preds_list:
-            mu = p.mean()
-            sd = p.std() + 1e-8
-            std_preds_list.append((p - mu) / sd)
-        # optional tanh clip from env var
-        clip = float(os.getenv("CAMHT_TANH_CLIP", "0.0"))
-        if clip > 0:
-            std_preds_list = [np.tanh(p / clip) for p in std_preds_list]
-        predictions.append(std_preds_list)  # list of 4 arrays [A]
+    base = series_df.sort(args.date_col)
+    values = base.drop(args.date_col).to_numpy()
+    dates = base[args.date_col].to_numpy().astype(np.int64)
+    windows = build_normalized_windows(values, args.window, 0.0)
+    feature_tensor = torch.from_numpy(windows).float()  # [D, A, W]
+    num_dates, num_assets, _ = feature_tensor.shape
+    time_grid = torch.linspace(0.0, 1.0, args.window, dtype=torch.float32, device=device).view(1, 1, args.window, 1)
+
+    predictions: list[list[np.ndarray]] = []
+    clip = float(os.getenv("CAMHT_TANH_CLIP", "0.0"))
+    with torch.no_grad():
+        for idx in range(num_dates):
+            x = feature_tensor[idx].unsqueeze(0).unsqueeze(-1).to(device, non_blocking=True)
+            times = time_grid.expand(1, num_assets, args.window, 1)
+            preds = model(x, times)
+            preds_np = [p.squeeze(0).float().cpu().numpy() for p in preds]
+            # 横截面 z-score 稳定秩序
+            std_preds = [(p - p.mean()) / (p.std() + 1e-8) for p in preds_np]
+            if clip > 0:
+                std_preds = [np.tanh(p / clip) for p in std_preds]
+            predictions.append(std_preds)
 
     # Prepare submission-like frame (not strictly Kaggle format here)
     # Save for inspection
     out_dir = Path("preds")
     out_dir.mkdir(exist_ok=True)
+    date_list = [int(d) for d in dates]
     for k, lag in enumerate([1, 2, 3, 4]):
         rows = []
-        for i, date_id in enumerate(series_df[args.date_col].unique(maintain_order=True).to_list()):
-            row = {args.date_col: int(date_id)}
+        for i, date_id in enumerate(date_list):
+            row = {args.date_col: date_id}
             for j, tname in enumerate(order):
                 row[tname] = predictions[i][k][j]
             rows.append(row)

@@ -4,7 +4,7 @@ import argparse
 import math
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import polars as pl
@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from camht.cpcv import CPCVSpec, cpcv_splits
-from camht.data import DataSpec, DailyRollingDataset, load_frames
+from camht.data import build_normalized_windows, load_frames
 from camht.losses import DiffSpearmanLoss, StabilityRegularizer
 from camht.metrics import spearman_rho
 from camht.model import CAMHT
@@ -32,8 +32,8 @@ def cosine_scheduler(t: int, T: int, lr_max: float, warmup_pct: float) -> float:
     return 0.5 * lr_max * (1 + math.cos(math.pi * q))
 
 
-def build_datasets(cfg) -> Tuple[DailyRollingDataset, List[int]]:
-    train, labels_given = load_frames(cfg.data.train_csv, cfg.data.labels_csv, cfg.data.date_column)
+def build_datasets(cfg):
+    train, _ = load_frames(cfg.data.train_csv, cfg.data.labels_csv, cfg.data.date_column)
     target_defs = parse_target_pairs(cfg.data.target_pairs_csv)
 
     # Compute per-target series from train.csv
@@ -50,128 +50,84 @@ def build_datasets(cfg) -> Tuple[DailyRollingDataset, List[int]]:
         y = (shifted - targets_only) / (targets_only.abs() + 1e-12)
         Ys[k] = pl.DataFrame({date_col: base[date_col]}).with_columns(y)
 
-    # Use k=1 for now to drive supervised training; others can be included via multi-task
-    labels = Ys[1]
+    values = base.drop(date_col).to_numpy()
+    dates = base[date_col].to_numpy()
+    # 一次性构建所有日期的滑窗并标准化，避免训练过程中重复做 numpy 拷贝
+    features = build_normalized_windows(values, cfg.data.window, cfg.data.winsorize_p)
+    feature_tensor = torch.from_numpy(features)  # [D, A, W]
+    time_grid = torch.linspace(0.0, 1.0, cfg.data.window, dtype=torch.float32).view(1, 1, cfg.data.window, 1)
 
-    spec = DataSpec(
-        window=cfg.data.window,
-        patch_len=cfg.data.patch_len,
-        patch_stride=cfg.data.patch_stride,
-        date_col=cfg.data.date_column,
-        feature_cols=None,
-        normalize_per_day=False,
+    horizons = [1, 2, 3, 4]
+    label_tensors = []
+    for k in horizons:
+        arr = Ys[k].drop(date_col).to_numpy()
+        label_tensors.append(torch.from_numpy(arr.astype(np.float32)))
+    labels_tensor = torch.stack(label_tensors, dim=0)  # [H, D, A]
+
+    dataset = TargetsWindowDataset(
+        features=feature_tensor,
+        labels=labels_tensor,
+        dates=torch.from_numpy(dates.astype(np.int64)),
+        batch_days=int(cfg.train.batch_days),
+        time_grid=time_grid,
     )
-
-    # Build dataset that uses only per-target pair series as a single feature channel
-    # Construct synthetic train frame with just date + each target series as its own column; we will map to [A, T, 1]
-    # The dataset class currently expects per-day rows of multiple assets; adapt by "assets == number of targets".
-    # We'll create a thin adapter dataset below.
-
-    return (build_adapter_dataset_multi(series_df, Ys, cfg), base[date_col].to_list())
+    return dataset, dataset.dates.tolist()
 
 
-class TargetsAdapterDataset(DailyRollingDataset):
-    """Adapter to interpret target series as assets with single-channel feature.
+class TargetsWindowDataset(torch.utils.data.Dataset):
+    """针对目标对序列的高性能滑窗数据集，彻底移除 Python for 循环。"""
 
-    Overridden _per_day_tensor to use target series window across targets.
-    """
+    def __init__(
+        self,
+        *,
+        features: torch.Tensor,
+        labels: torch.Tensor,
+        dates: torch.Tensor,
+        batch_days: int,
+        time_grid: torch.Tensor,
+        indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        if features.ndim != 3:
+            raise ValueError("features must be [D, A, W]")
+        self.features = features.float()
+        self.labels = labels.float()  # [H, D, A]
+        self.dates = dates.long()
+        self.batch_days = batch_days
+        self.time_grid = time_grid.float()
+        total = features.shape[0]
+        base_idx = torch.arange(total, dtype=torch.long)
+        self.indices = base_idx if indices is None else base_idx.index_select(0, indices.long())
+        self.num_assets = features.shape[1]
+        self.window = features.shape[2]
 
-    def __init__(self, series_df: pl.DataFrame, labels_df: pl.DataFrame, spec: DataSpec, batch_days: int, winsorize_p: float):
-        super().__init__(series_df, labels_df, spec, batch_days, winsorize_p)
-        # here feature_cols are targets themselves
-        self.feature_cols = [c for c in series_df.columns if c != spec.date_col]
-        self.target_cols = self.feature_cols
-
-    def _per_day_tensor(self, date: int):
-        window_df = self._slice_window(date)
-        # x: assets == number of targets, feature channel C=1 from its own column
-        W = window_df.select(self.feature_cols).to_numpy()  # [T, A]
-        if self.winsorize_p > 0:
-            W = np.apply_along_axis(lambda a: np.clip(a, np.quantile(a, self.winsorize_p), np.quantile(a, 1 - self.winsorize_p)), 0, W)
-        W = W[-self.spec.window :]
-        # normalize each asset series over the window
-        mu = W.mean(axis=0, keepdims=True)
-        sd = W.std(axis=0, keepdims=True) + 1e-8
-        W = (W - mu) / sd
-        # [A, T, 1]
-        x = np.expand_dims(W.T, -1)
-        times = np.linspace(0, 1, x.shape[1], dtype=np.float32)[None, :, None].repeat(x.shape[0], axis=0)
-        # label vector for the date
-        y = self._label_groups.get_group(date).select(self.target_cols).to_numpy().squeeze(0)
-        return (
-            torch.from_numpy(x.astype(np.float32)),
-            torch.from_numpy(times.astype(np.float32)),
-            torch.from_numpy(y.astype(np.float32)),
+    def view(self, idxs: Sequence[int]) -> "TargetsWindowDataset":
+        if isinstance(idxs, torch.Tensor):
+            idx_tensor = idxs.to(torch.long)
+        else:
+            idx_tensor = torch.as_tensor(list(idxs), dtype=torch.long)
+        return TargetsWindowDataset(
+            features=self.features,
+            labels=self.labels,
+            dates=self.dates,
+            batch_days=self.batch_days,
+            time_grid=self.time_grid,
+            indices=self.indices.index_select(0, idx_tensor),
         )
 
-
-def build_adapter_dataset(series_df: pl.DataFrame, labels: pl.DataFrame, cfg) -> TargetsAdapterDataset:
-    spec = DataSpec(
-        window=cfg.data.window,
-        patch_len=cfg.data.patch_len,
-        patch_stride=cfg.data.patch_stride,
-        date_col=cfg.data.date_column,
-        feature_cols=None,
-        normalize_per_day=False,
-    )
-    return TargetsAdapterDataset(series_df, labels, spec, cfg.train.batch_days, cfg.data.winsorize_p)
-
-
-class TargetsAdapterDatasetMulti(TargetsAdapterDataset):
-    def __init__(self, series_df: pl.DataFrame, labels_by_lag: dict[int, pl.DataFrame], spec: DataSpec, batch_days: int, winsorize_p: float):
-        # use lag-1 to initialize parent
-        super().__init__(series_df, labels_by_lag[1], spec, batch_days, winsorize_p)
-        self.label_groups_list = [labels_by_lag[k].groupby(spec.date_col, maintain_order=True) for k in [1, 2, 3, 4]]
-
-    def _per_day_tensor_multi(self, date: int):
-        # Reuse super to get x,t and ignore single y
-        x, t, _ = super()._per_day_tensor(date)
-        ys = []
-        for g in self.label_groups_list:
-            y = g.get_group(date).select(self.target_cols).to_numpy().squeeze(0)
-            ys.append(torch.from_numpy(y.astype(np.float32)))
-        return x, t, ys
+    def __len__(self) -> int:
+        return max(0, (self.indices.numel() + self.batch_days - 1) // self.batch_days)
 
     def __getitem__(self, idx: int):
         start = idx * self.batch_days
-        end = min(len(self.dates), start + self.batch_days)
-        batch_dates = self.dates[start:end]
-        xs, ts, ys_list = [], [], []  # ys_list: list over days of list over horizon
-        for d in batch_dates:
-            x, t, ys = self._per_day_tensor_multi(d)
-            xs.append(x)
-            ts.append(t)
-            ys_list.append(ys)
-        # pad batch dims
-        max_A = max(x.shape[0] for x in xs)
-        T = xs[0].shape[1]
-        B = len(xs)
-        x_pad = torch.zeros((B, max_A, T, 1), dtype=torch.float32)
-        t_pad = torch.zeros((B, max_A, T, 1), dtype=torch.float32)
-        # prepare y pads per horizon
-        H = len(ys_list[0])
-        y_pads = [torch.full((B, max_A), float("nan"), dtype=torch.float32) for _ in range(H)]
-        for i in range(B):
-            a = xs[i].shape[0]
-            x_pad[i, :a] = xs[i]
-            t_pad[i, :a] = ts[i]
-            for h in range(H):
-                y = ys_list[i][h]
-                y_len = min(a, y.shape[0])
-                y_pads[h][i, :y_len] = y[:y_len]
-        return x_pad, t_pad, y_pads, batch_dates
-
-
-def build_adapter_dataset_multi(series_df: pl.DataFrame, labels_by_lag: dict[int, pl.DataFrame], cfg) -> TargetsAdapterDatasetMulti:
-    spec = DataSpec(
-        window=cfg.data.window,
-        patch_len=cfg.data.patch_len,
-        patch_stride=cfg.data.patch_stride,
-        date_col=cfg.data.date_column,
-        feature_cols=None,
-        normalize_per_day=False,
-    )
-    return TargetsAdapterDatasetMulti(series_df, labels_by_lag, spec, cfg.train.batch_days, cfg.data.winsorize_p)
+        end = min(self.indices.numel(), start + self.batch_days)
+        sel = self.indices[start:end]
+        # 全部 tensor 操作，无 Python 循环，保持 torch.compile 友好
+        x = self.features.index_select(0, sel).unsqueeze(-1)  # [B, A, W, 1]
+        times = self.time_grid.expand(x.shape[0], self.num_assets, self.window, 1)
+        y_block = self.labels.index_select(1, sel)  # [H, B, A]
+        ys = list(y_block.unbind(0))
+        batch_dates = self.dates.index_select(0, sel).tolist()
+        return x, times, ys, batch_dates
 
 
 def train_one_epoch(model, loader, optimizer, scaler, loss_main, loss_stab, device, epoch, total_epochs, lr_max, warmup_pct):
@@ -179,11 +135,14 @@ def train_one_epoch(model, loader, optimizer, scaler, loss_main, loss_stab, devi
     total_loss = 0.0
     total_rho = 0.0
     steps = 0
-    for x, t, ys, batch_dates in loader:
+    steps_per_epoch = max(1, len(loader))
+    total_steps = max(1, total_epochs * steps_per_epoch)
+    base_step = epoch * steps_per_epoch
+    for step, (x, t, ys, batch_dates) in enumerate(loader):
         x = x.to(device)
         t = t.to(device)
         ys = [y.to(device) for y in ys]
-        lr = cosine_scheduler(epoch, total_epochs, lr_max, warmup_pct)
+        lr = cosine_scheduler(base_step + step, total_steps, lr_max, warmup_pct)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
         optimizer.zero_grad(set_to_none=True)
@@ -230,16 +189,33 @@ def evaluate(model, loader, loss_main, loss_stab, device, return_daily: bool = F
             loss = loss + loss_main(preds_list[k], ys[k]) + loss_stab(preds_list[k], ys[k])
         preds = preds_list[0]
         total_loss += loss.item()
-        # compute per-day rho within this sample (B days inside)
-        P = preds
-        T = ys[0]
-        for i in range(P.shape[0]):
-            m = ~torch.isnan(T[i])
-            if m.sum() < 2:
-                continue
-            rho_i = spearman_rho(P[i][None, m], T[i][None, m]).item()
-            daily_rhos.append(rho_i)
-        total_rho += spearman_rho(preds, ys[0]).item()
+        # compute per-day rho within这个 batch（完全向量化处理缺失值）
+        target = ys[0]
+        mask = ~torch.isnan(target)
+        valid = mask.sum(dim=-1) >= 2
+        fill_value = torch.finfo(preds.dtype).min
+        preds_masked = torch.where(mask, preds, torch.full_like(preds, fill_value))
+        target_masked = torch.where(mask, target, torch.full_like(target, fill_value))
+        rank_preds = torch.argsort(torch.argsort(preds_masked, dim=-1), dim=-1).float()
+        rank_target = torch.argsort(torch.argsort(target_masked, dim=-1), dim=-1).float()
+        rank_preds = torch.where(mask, rank_preds, torch.zeros_like(rank_preds))
+        rank_target = torch.where(mask, rank_target, torch.zeros_like(rank_target))
+        mask_f = mask.to(preds.dtype)
+        counts = mask.sum(dim=-1).clamp_min(1).float()
+        mean_p = (rank_preds * mask_f).sum(dim=-1, keepdim=True) / counts
+        mean_t = (rank_target * mask_f).sum(dim=-1, keepdim=True) / counts
+        xc = (rank_preds - mean_p) * mask_f
+        yc = (rank_target - mean_t) * mask_f
+        eps = 1e-8
+        cov = (xc * yc).sum(dim=-1) / counts.squeeze(-1)
+        var_p = (xc.pow(2).sum(dim=-1) / counts.squeeze(-1)).clamp_min(eps)
+        var_t = (yc.pow(2).sum(dim=-1) / counts.squeeze(-1)).clamp_min(eps)
+        rho_day = cov / (var_p.sqrt() * var_t.sqrt() + eps)
+        valid_rho = rho_day[valid]
+        if return_daily:
+            daily_rhos.extend(valid_rho.detach().cpu().tolist())
+        batch_mean_rho = valid_rho.mean().item() if valid_rho.numel() > 0 else 0.0
+        total_rho += batch_mean_rho
         steps += 1
     if return_daily:
         return total_loss / max(1, steps), total_rho / max(1, steps), daily_rhos
@@ -258,10 +234,8 @@ def main():
 
     dataset, date_list = build_datasets(cfg)
 
-    def subset(ds, idxs):
-        ds2 = ds
-        ds2.dates = [ds.dates[i] for i in idxs]
-        return ds2
+    def subset(ds: TargetsWindowDataset, idxs):
+        return ds.view(idxs)
 
     ckpt_dir = Path(cfg.train.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -274,7 +248,7 @@ def main():
 
     if use_cpcv:
         # CPCV outer loop
-        dates = dataset.dates
+        dates = dataset.dates.tolist()
         from camht.cpcv import CPCVSpec, cpcv_splits
 
         spec = CPCVSpec(n_splits=int(cfg.cv.n_splits), embargo_days=int(cfg.cv.embargo_days))
@@ -356,7 +330,7 @@ def main():
             shutil.copy2(best_global_path, final_path)
     else:
         # Simple holdout
-        n = len(dataset.dates)
+        n = dataset.dates.numel()
         val_cut = int(n * (1 - cfg.cv.test_size_fraction))
         train_dates_idx = list(range(0, val_cut))
         val_dates_idx = list(range(val_cut, n))

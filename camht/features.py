@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class Time2Vec(nn.Module):
@@ -45,13 +46,13 @@ class Patchify(nn.Module):
         B, T, C = x.shape
         P, S = self.spec.size, self.spec.stride
         if T < P:
-            # left-pad with zeros to reach at least one patch
             pad = P - T
-            x = torch.nn.functional.pad(x, (0, 0, pad, 0))
+            # 仅在时间维度左侧做零填充，保持首端信息不丢失
+            x = F.pad(x, (0, 0, pad, 0))
             T = x.shape[1]
         n = 1 + (T - P) // S
-        idx = torch.arange(0, n * S, S, device=x.device)
-        patches = torch.stack([x[:, i : i + P, :] for i in idx], dim=1)
+        # `unfold` 在 C++ 内部完成窗口抽取，比 Python for 循环快几个数量级
+        patches = x.unfold(dimension=1, size=P, step=S).permute(0, 1, 3, 2).contiguous()
         return patches, n
 
 
@@ -67,4 +68,3 @@ class FlattenPatches(nn.Module):
         B, N, P, C = x.shape
         x = x.reshape(B, N, P * C)
         return self.proj(x)
-

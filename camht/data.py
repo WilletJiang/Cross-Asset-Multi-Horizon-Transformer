@@ -7,6 +7,7 @@ import numpy as np
 import polars as pl
 import torch
 from torch.utils.data import Dataset
+from numpy.lib.stride_tricks import sliding_window_view
 
 
 @dataclass
@@ -31,6 +32,36 @@ def winsorize(x: np.ndarray, p: float = 0.005) -> np.ndarray:
         return x
     lo, hi = np.quantile(x, [p, 1 - p])
     return np.clip(x, lo, hi)
+
+
+def build_normalized_windows(
+    values: np.ndarray,
+    window: int,
+    winsorize_p: float = 0.0,
+) -> np.ndarray:
+    """Return [D, A, window] tensor化滑窗并做逐资产标准化。
+
+    参数:
+        values: [D, A] 原始矩阵（按日期排序）
+        window: 滑窗长度
+        winsorize_p: 每侧截尾百分比
+    """
+    if window <= 0:
+        raise ValueError("window must be positive")
+    values = np.asarray(values, dtype=np.float32)
+    pad = max(window - 1, 0)
+    if pad:
+        head = np.repeat(values[:1], pad, axis=0)
+        values = np.concatenate([head, values], axis=0)
+    windows = sliding_window_view(values, window_shape=(window,), axis=0)  # [D, A, window]
+    windows = windows.astype(np.float32, copy=False)
+    if winsorize_p > 0:
+        lo = np.quantile(windows, winsorize_p, axis=-1, keepdims=True)
+        hi = np.quantile(windows, 1 - winsorize_p, axis=-1, keepdims=True)
+        windows = np.clip(windows, lo, hi)
+    mean = windows.mean(axis=-1, keepdims=True)
+    std = windows.std(axis=-1, keepdims=True) + 1e-6
+    return (windows - mean) / std
 
 
 class DailyRollingDataset(Dataset):
@@ -154,4 +185,3 @@ def load_frames(
     train = pl.read_csv(train_csv)
     labels = pl.read_csv(labels_csv)
     return train, labels
-

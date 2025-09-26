@@ -9,6 +9,7 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
+from camht.data import build_normalized_windows
 from camht.targets import parse_target_pairs, compute_target_matrix
 from camht.timae import TiMAE
 from camht.utils import SDPPolicy, configure_sdp, console, get_device, maybe_compile, set_seed
@@ -16,44 +17,26 @@ from camht.utils import SDPPolicy, configure_sdp, console, get_device, maybe_com
 
 class SeriesDataset(Dataset):
     def __init__(self, series_df: pl.DataFrame, date_col: str, window: int, batch_days: int):
-        self.df = series_df.sort(date_col)
-        self.date_col = date_col
-        self.window = window
+        df = series_df.sort(date_col)
+        values = df.drop([date_col]).to_numpy()
+        self.features = torch.from_numpy(build_normalized_windows(values, window, 0.0))  # [D, A, W]
+        self.dates = torch.from_numpy(df[date_col].to_numpy().astype(np.int64))
         self.batch_days = batch_days
-        self.dates = self.df[date_col].unique(maintain_order=True).to_list()
+        self.window = window
+        self.num_assets = self.features.shape[1]
+        self.time_grid = torch.linspace(0.0, 1.0, window, dtype=torch.float32).view(1, 1, window, 1)
+        self.indices = torch.arange(self.features.shape[0], dtype=torch.long)
 
-    def __len__(self):
-        return max(1, (len(self.dates) + self.batch_days - 1) // self.batch_days)
+    def __len__(self) -> int:
+        return max(0, (self.indices.numel() + self.batch_days - 1) // self.batch_days)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         start = idx * self.batch_days
-        end = min(len(self.dates), start + self.batch_days)
-        dates = self.dates[start:end]
-        xs, ts = [], []
-        for d in dates:
-            hist = self.df.filter(pl.col(self.date_col) <= d)
-            X = hist.drop([self.date_col]).to_numpy()  # [T, A]
-            X = X[-self.window :]
-            mu = X.mean(axis=0, keepdims=True)
-            sd = X.std(axis=0, keepdims=True) + 1e-8
-            X = (X - mu) / sd
-            X = np.expand_dims(X.T, -1)  # [A, T, 1]
-            xs.append(X)
-            T = X.shape[1]
-            ts.append(np.linspace(0, 1, T, dtype=np.float32)[None, :, None].repeat(X.shape[0], axis=0))
-        A = max(x.shape[0] for x in xs)
-        T = xs[0].shape[1]
-        B = len(xs)
-        x_pad = np.zeros((B, A, T, 1), dtype=np.float32)
-        t_pad = np.zeros((B, A, T, 1), dtype=np.float32)
-        for i in range(B):
-            a = xs[i].shape[0]
-            x_pad[i, :a] = xs[i]
-            t_pad[i, :a] = ts[i]
-        return (
-            torch.from_numpy(x_pad),
-            torch.from_numpy(t_pad),
-        )
+        end = min(self.indices.numel(), start + self.batch_days)
+        sel = self.indices[start:end]
+        x = self.features.index_select(0, sel).unsqueeze(-1)  # [B, A, W, 1]
+        t = self.time_grid.expand(x.shape[0], self.num_assets, self.window, 1)
+        return x, t
 
 
 def main():
@@ -123,4 +106,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

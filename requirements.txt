@@ -1,4 +1,4 @@
-torch>=2.2
+torch>=2.3  # Hopper(H800)/Blackwell(5090) 需要CUDA 12.3+ 构建
 polars>=0.20
 numpy>=1.24
 pandas>=2.0
@@ -6,7 +6,7 @@ pyarrow>=14.0
 omegaconf>=2.3
 scikit-learn>=1.3
 torchsort>=0.1.9
-flash-attn>=2.5.6; platform_system == "Linux"
+flash-attn>=2.6.1; platform_system == "Linux"  # >=2.6 支持 SM90/SM100 内核
 skfolio>=0.3.1
 einops>=0.7
 rich>=13.7

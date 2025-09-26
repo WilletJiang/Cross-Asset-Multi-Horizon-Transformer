@@ -12,6 +12,7 @@ import torch
 import kaggle_evaluation.core.templates
 from kaggle_evaluation.core.templates import InferenceServer
 
+from camht.data import build_normalized_windows
 from camht.model import CAMHT
 from camht.targets import compute_target_matrix, parse_target_pairs
 from camht.utils import SDPPolicy, configure_sdp, get_device
@@ -51,23 +52,20 @@ def predict_endpoint(model: CAMHT, test_hist: pl.DataFrame, label_lag_1: pl.Data
         raise FileNotFoundError("target_pairs.csv not found in expected locations")
     defs = parse_target_pairs(str(target_pairs_path))
     series_df, order = compute_target_matrix(test_hist, date_col, defs)
-    # Prepare window
     window = 512
-    series_df = series_df.sort(date_col)
-    sub = series_df[-window:]
-    X = sub.drop([date_col]).to_numpy()  # [T, A]
-    mu = X.mean(axis=0, keepdims=True)
-    sd = X.std(axis=0, keepdims=True) + 1e-8
-    X = (X - mu) / sd
-    X = np.expand_dims(X.T, -1)  # [A, T, 1]
-    T = X.shape[1]
-    times = np.linspace(0, 1, T, dtype=np.float32)[None, :, None].repeat(X.shape[0], axis=0)
+    base = series_df.sort(date_col)
+    values = base.drop(date_col).to_numpy()
+    # 复用训练端的滑窗标准化，确保线上和离线统计完全一致
+    windows = build_normalized_windows(values, window, 0.0)
+    latest = torch.from_numpy(windows[-1]).float()  # [A, W]
+    times_grid = torch.linspace(0.0, 1.0, window, dtype=torch.float32)
+    times = times_grid.view(1, 1, window, 1).expand(1, latest.shape[0], window, 1)
 
     device = next(model.parameters()).device
     with torch.no_grad():
         preds = model(
-            torch.from_numpy(X).unsqueeze(0).to(device),
-            torch.from_numpy(times).unsqueeze(0).to(device),
+            latest.unsqueeze(0).unsqueeze(-1).to(device),
+            times.to(device),
         )  # list of 4 [1, A]
         preds = [p.squeeze(0).float().cpu().numpy() for p in preds]
     # Day-level standardization (stabilize ranks)
