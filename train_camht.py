@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -46,6 +47,49 @@ def cosine_scheduler(t: int, T: int, lr_max: float, warmup_pct: float) -> float:
         return lr_max * (t + 1) / warmup
     q = (t - warmup) / max(1, T - warmup)
     return 0.5 * lr_max * (1 + math.cos(math.pi * q))
+
+
+def _loader_kwargs(section: Dict[str, object] | None, *, device: torch.device) -> Dict[str, object]:
+    """Derive DataLoader keyword arguments with sensible defaults for RTX5090."""
+
+    if section is None:
+        section = {}
+
+    num_workers = int(section.get("num_workers", 0) or 0)
+    pin_memory = bool(section.get("pin_memory", device.type == "cuda"))
+    pin_memory_device = section.get("pin_memory_device", "cuda" if pin_memory and device.type == "cuda" else "")
+    prefetch_factor = section.get("prefetch_factor", None)
+    if num_workers <= 0:
+        prefetch_factor = None
+    else:
+        if prefetch_factor is None:
+            prefetch_factor = 4
+        prefetch_factor = int(prefetch_factor)
+    persistent_workers = bool(section.get("persistent_workers", num_workers > 0))
+
+    kwargs: Dict[str, object] = {
+        "batch_size": 1,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+    }
+    if prefetch_factor is not None:
+        kwargs["prefetch_factor"] = prefetch_factor
+    if pin_memory and pin_memory_device:
+        kwargs["pin_memory_device"] = str(pin_memory_device)
+    drop_last = section.get("drop_last", False)
+    if drop_last:
+        kwargs["drop_last"] = True
+    return kwargs
+
+
+def _seed_worker(worker_id: int) -> None:
+    """Ensure deterministic-ish dataloader workers while retaining cudnn.benchmark."""
+
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def build_datasets(cfg):
@@ -122,6 +166,13 @@ def build_datasets(cfg):
     return dataset, dataset.dates.tolist()
 
 
+def build_loader(dataset: "TargetsWindowDataset", cfg_section: Dict[str, object] | None, device: torch.device) -> DataLoader:
+    kwargs = _loader_kwargs(cfg_section, device=device)
+    num_workers = int(kwargs.get("num_workers", 0))
+    worker_init_fn = _seed_worker if num_workers > 0 else None
+    return DataLoader(dataset, worker_init_fn=worker_init_fn, **kwargs)
+
+
 class TargetsWindowDataset(torch.utils.data.Dataset):
     """针对目标对序列的高性能滑窗数据集，彻底移除 Python for 循环。"""
 
@@ -173,11 +224,9 @@ class TargetsWindowDataset(torch.utils.data.Dataset):
         x = self.features.index_select(0, sel).unsqueeze(-1)  # [B, A, W, 1]
         times = self.time_grid.expand(x.shape[0], self.num_assets, self.window, 1)
         y_block = self.labels.index_select(1, sel)  # [H, B, A]
-        ys = list(y_block.unbind(0))
-        counts = (~torch.isnan(y_block)).sum(dim=-1).float()
-        counts_list = list(counts.unbind(0))
+        mask_block = ~torch.isnan(y_block)
         batch_dates = self.dates.index_select(0, sel).tolist()
-        return x, times, ys, counts_list, batch_dates
+        return x, times, y_block, mask_block, batch_dates
 
 
 def train_one_epoch(
@@ -194,6 +243,8 @@ def train_one_epoch(
     warmup_pct,
     amp_dtype,
     amp_enabled,
+    grad_accum,
+    grad_clip,
 ):
     model.train()
     total_loss = 0.0
@@ -202,51 +253,89 @@ def train_one_epoch(
     steps_per_epoch = max(1, len(loader))
     total_steps = max(1, total_epochs * steps_per_epoch)
     base_step = epoch * steps_per_epoch
+    pending_batches = 0
+    optimizer.zero_grad(set_to_none=True)
     for step, (x, t, ys, counts, batch_dates) in enumerate(loader):
-        x = x.to(device)
-        t = t.to(device)
+        x = x.to(device=device, non_blocking=True)
+        t = t.to(device=device, non_blocking=True)
         if x.dim() > 4 and x.shape[0] == 1:
             x = x.squeeze(0)
         if t.dim() > 4 and t.shape[0] == 1:
             t = t.squeeze(0)
-        ys = [y.to(device) for y in ys]
-        ys = [y.squeeze(0) if y.dim() > 2 and y.shape[0] == 1 else y for y in ys]
-        counts = [c.to(device) for c in counts]
-        counts = [c.squeeze(0) if c.dim() > 1 and c.shape[0] == 1 else c for c in counts]
-        total_weight = sum(float(c.sum().item()) for c in counts)
+        ys = ys.to(device=device, non_blocking=True)
+        counts = counts.to(device=device, non_blocking=True)
+        if ys.dim() > 3 and ys.shape[0] == 1:
+            ys = ys.squeeze(0)
+        if counts.dim() > 3 and counts.shape[0] == 1:
+            counts = counts.squeeze(0)
+        total_weight = float(counts.sum().item())
         if total_weight <= 0:
             continue
         lr = cosine_scheduler(base_step + step, total_steps, lr_max, warmup_pct)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
-        optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            preds_list = model(x, t)
-            weighted_terms = []
-            for k in range(min(len(preds_list), len(counts))):
-                weight = float(counts[k].sum().item()) / total_weight
-                if weight <= 0:
-                    continue
-                loss_k = loss_main(preds_list[k], ys[k])
-                stab_k = loss_stab(preds_list[k], ys[k])
-                weighted_terms.append(weight * (loss_k + stab_k))
-            if not weighted_terms:
+            preds = model(x, t)
+            if isinstance(preds, (list, tuple)):
+                preds = torch.stack(preds, dim=0)
+            row_weights = counts.sum(dim=-1)  # [H, B]
+            loss_primary = loss_main(
+                preds,
+                ys,
+                row_weights=row_weights,
+            )
+            horizon_weights = row_weights.sum(dim=-1).to(preds.dtype)
+            weight_sum = float(horizon_weights.sum().item())
+            if weight_sum <= 0:
                 continue
-            loss = torch.stack(weighted_terms).sum()
+            horizon_weights = horizon_weights / horizon_weights.sum()
+            stab_terms: List[torch.Tensor] = []
+            for h in range(preds.shape[0]):
+                if float(horizon_weights[h].item()) <= 0:
+                    continue
+                stab_terms.append(horizon_weights[h] * loss_stab(preds[h], ys[h]))
+            stability = (
+                torch.stack(stab_terms).sum()
+                if stab_terms
+                else loss_primary.new_zeros(())
+            )
+            step_loss = loss_primary + stability
         if scaler is not None and scaler.is_enabled():
-            scaler.scale(loss).backward()
+            scaler.scale(step_loss / grad_accum).backward()
+        else:
+            (step_loss / grad_accum).backward()
+        pending_batches += 1
+        should_step = pending_batches == grad_accum
+        def _step_optimizer() -> None:
+            nonlocal pending_batches
+            if scaler is not None and scaler.is_enabled():
+                scaler.unscale_(optimizer)
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            if scaler is not None and scaler.is_enabled():
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            pending_batches = 0
+        if should_step:
+            _step_optimizer()
+        with torch.no_grad():
+            total_loss += step_loss.item()
+            total_rho += spearman_rho(preds[0], ys[0], mask=counts[0]).item()
+            steps += 1
+    if pending_batches > 0:
+        if scaler is not None and scaler.is_enabled():
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        if scaler is not None and scaler.is_enabled():
             scaler.step(optimizer)
             scaler.update()
         else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-        with torch.no_grad():
-            total_loss += loss.item()
-            total_rho += spearman_rho(preds_list[0], ys[0]).item()
-            steps += 1
+        optimizer.zero_grad(set_to_none=True)
     if steps == 0:
         return 0.0, 0.0
     return total_loss / steps, total_rho / steps
@@ -260,58 +349,49 @@ def evaluate(model, loader, loss_main, loss_stab, device, amp_dtype, amp_enabled
     steps = 0
     daily_rhos: list[float] = []
     for x, t, ys, counts, batch_dates in loader:
-        x = x.to(device)
-        t = t.to(device)
+        x = x.to(device=device, non_blocking=True)
+        t = t.to(device=device, non_blocking=True)
         if x.dim() > 4 and x.shape[0] == 1:
             x = x.squeeze(0)
         if t.dim() > 4 and t.shape[0] == 1:
             t = t.squeeze(0)
-        ys = [y.to(device) for y in ys]
-        ys = [y.squeeze(0) if y.dim() > 2 and y.shape[0] == 1 else y for y in ys]
-        counts = [c.to(device) for c in counts]
-        counts = [c.squeeze(0) if c.dim() > 1 and c.shape[0] == 1 else c for c in counts]
-        total_weight = sum(float(c.sum().item()) for c in counts)
+        ys = ys.to(device=device, non_blocking=True)
+        counts = counts.to(device=device, non_blocking=True)
+        if ys.dim() > 3 and ys.shape[0] == 1:
+            ys = ys.squeeze(0)
+        if counts.dim() > 3 and counts.shape[0] == 1:
+            counts = counts.squeeze(0)
+        total_weight = float(counts.sum().item())
         if total_weight <= 0:
             continue
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            preds_list = model(x, t)
-        loss_val = 0.0
-        for k in range(min(len(preds_list), len(counts))):
-            weight = float(counts[k].sum().item()) / total_weight
-            if weight <= 0:
+            preds = model(x, t)
+            if isinstance(preds, (list, tuple)):
+                preds = torch.stack(preds, dim=0)
+        row_weights = counts.sum(dim=-1)
+        horizon_weights = row_weights.sum(dim=-1).to(preds.dtype)
+        if float(horizon_weights.sum().item()) <= 0:
+            continue
+        loss_primary = loss_main(preds, ys, row_weights=row_weights)
+        horizon_weights = horizon_weights / horizon_weights.sum()
+        stab_terms: List[torch.Tensor] = []
+        for h in range(preds.shape[0]):
+            if float(horizon_weights[h].item()) <= 0:
                 continue
-            loss_val += weight * (
-                loss_main(preds_list[k], ys[k]).item() + loss_stab(preds_list[k], ys[k]).item()
-            )
+            stab_terms.append(horizon_weights[h] * loss_stab(preds[h], ys[h]))
+        stability = (
+            torch.stack(stab_terms).sum()
+            if stab_terms
+            else loss_primary.new_zeros(())
+        )
+        loss_val = (loss_primary + stability).item()
         total_loss += loss_val
-        preds = preds_list[0]
-        # compute per-day rho within这个 batch（完全向量化处理缺失值）
-        target = ys[0]
-        mask = ~torch.isnan(target)
-        valid = mask.sum(dim=-1) >= 2
-        fill_value = torch.finfo(preds.dtype).min
-        preds_masked = torch.where(mask, preds, torch.full_like(preds, fill_value))
-        target_masked = torch.where(mask, target, torch.full_like(target, fill_value))
-        rank_preds = torch.argsort(torch.argsort(preds_masked, dim=-1), dim=-1).float()
-        rank_target = torch.argsort(torch.argsort(target_masked, dim=-1), dim=-1).float()
-        rank_preds = torch.where(mask, rank_preds, torch.zeros_like(rank_preds))
-        rank_target = torch.where(mask, rank_target, torch.zeros_like(rank_target))
-        mask_f = mask.to(preds.dtype)
-        valid_counts = mask.sum(dim=-1).clamp_min(1).float()
-        mean_p = (rank_preds * mask_f).sum(dim=-1, keepdim=True) / valid_counts
-        mean_t = (rank_target * mask_f).sum(dim=-1, keepdim=True) / valid_counts
-        xc = (rank_preds - mean_p) * mask_f
-        yc = (rank_target - mean_t) * mask_f
-        eps = 1e-8
-        cov = (xc * yc).sum(dim=-1) / valid_counts.squeeze(-1)
-        var_p = (xc.pow(2).sum(dim=-1) / valid_counts.squeeze(-1)).clamp_min(eps)
-        var_t = (yc.pow(2).sum(dim=-1) / valid_counts.squeeze(-1)).clamp_min(eps)
-        rho_day = cov / (var_p.sqrt() * var_t.sqrt() + eps)
-        valid_rho = rho_day[valid]
-        if return_daily:
-            daily_rhos.extend(valid_rho.detach().cpu().tolist())
-        batch_mean_rho = valid_rho.mean().item() if valid_rho.numel() > 0 else 0.0
-        total_rho += batch_mean_rho
+        rho_rows, valid_rows = spearman_rho(preds[0], ys[0], mask=counts[0], reduce=False)
+        if valid_rows.any():
+            vals = rho_rows[valid_rows]
+            total_rho += vals.mean().item()
+            if return_daily:
+                daily_rhos.extend(vals.detach().cpu().tolist())
         steps += 1
     if steps == 0:
         if return_daily:
@@ -339,6 +419,8 @@ def main():
 
     amp_dtype = _resolve_amp_dtype(cfg.train.get("amp_dtype", "auto"))
     amp_enabled = bool(cfg.train.amp) and device.type == "cuda"
+    grad_accum = max(1, int(cfg.train.get("grad_accum", 1)))
+    grad_clip = float(cfg.train.get("grad_clip_norm", 0.0))
 
     dataset, date_list = build_datasets(cfg)
 
@@ -361,8 +443,16 @@ def main():
 
         spec = CPCVSpec(n_splits=int(cfg.cv.n_splits), embargo_days=int(cfg.cv.embargo_days))
         for fold_id, (tr_idx, te_idx) in enumerate(cpcv_splits(dates, spec)):
-            train_loader = DataLoader(subset(dataset, tr_idx), batch_size=1, shuffle=False, num_workers=0)
-            val_loader = DataLoader(subset(dataset, te_idx), batch_size=1, shuffle=False, num_workers=0)
+            train_loader = build_loader(
+                subset(dataset, tr_idx),
+                cfg.train.get("train_loader"),
+                device,
+            )
+            val_loader = build_loader(
+                subset(dataset, te_idx),
+                cfg.train.get("eval_loader", cfg.train.get("train_loader")),
+                device,
+            )
 
             model = CAMHT(
                 in_channels=1,
@@ -390,7 +480,18 @@ def main():
                     console.print("[green]Loaded TiMAE encoder weights")
                 except Exception as e:  # noqa: BLE001
                     console.print(f"[yellow]Pretrain load failed: {e}")
-            opt = optim.AdamW(model.parameters(), lr=cfg.train.lr_max, weight_decay=cfg.train.weight_decay)
+            opt_kwargs = {
+                "lr": cfg.train.lr_max,
+                "weight_decay": cfg.train.weight_decay,
+            }
+            if device.type == "cuda":
+                opt_kwargs.update({"fused": True, "capturable": True})
+            try:
+                opt = optim.AdamW(model.parameters(), **opt_kwargs)
+            except TypeError:
+                opt_kwargs.pop("fused", None)
+                opt_kwargs.pop("capturable", None)
+                opt = optim.AdamW(model.parameters(), **opt_kwargs)
             scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
             loss_main = DiffSpearmanLoss(cfg.loss.diffsort_temperature, cfg.loss.diffsort_regularization)
             loss_stab = StabilityRegularizer(cfg.loss.stability_lambda)
@@ -414,6 +515,8 @@ def main():
                     cfg.train.warmup_pct,
                     amp_dtype,
                     amp_enabled,
+                    grad_accum,
+                    grad_clip,
                 )
                 val_loss, val_rho, daily = evaluate(model, val_loader, loss_main, loss_stab, device, amp_dtype, amp_enabled, return_daily=True)
                 mean = float(np.mean(daily)) if len(daily) else 0.0
@@ -454,8 +557,16 @@ def main():
         val_cut = int(n * (1 - cfg.cv.test_size_fraction))
         train_dates_idx = list(range(0, val_cut))
         val_dates_idx = list(range(val_cut, n))
-        train_loader = DataLoader(subset(dataset, train_dates_idx), batch_size=1, shuffle=False, num_workers=0)
-        val_loader = DataLoader(subset(dataset, val_dates_idx), batch_size=1, shuffle=False, num_workers=0)
+        train_loader = build_loader(
+            subset(dataset, train_dates_idx),
+            cfg.train.get("train_loader"),
+            device,
+        )
+        val_loader = build_loader(
+            subset(dataset, val_dates_idx),
+            cfg.train.get("eval_loader", cfg.train.get("train_loader")),
+            device,
+        )
 
         model = CAMHT(
             in_channels=1,
@@ -482,7 +593,18 @@ def main():
                 console.print("[green]Loaded TiMAE encoder weights")
             except Exception as e:  # noqa: BLE001
                 console.print(f"[yellow]Pretrain load failed: {e}")
-        opt = optim.AdamW(model.parameters(), lr=cfg.train.lr_max, weight_decay=cfg.train.weight_decay)
+        opt_kwargs = {
+            "lr": cfg.train.lr_max,
+            "weight_decay": cfg.train.weight_decay,
+        }
+        if device.type == "cuda":
+            opt_kwargs.update({"fused": True, "capturable": True})
+        try:
+            opt = optim.AdamW(model.parameters(), **opt_kwargs)
+        except TypeError:
+            opt_kwargs.pop("fused", None)
+            opt_kwargs.pop("capturable", None)
+            opt = optim.AdamW(model.parameters(), **opt_kwargs)
         scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
         loss_main = DiffSpearmanLoss(cfg.loss.diffsort_temperature, cfg.loss.diffsort_regularization)
         loss_stab = StabilityRegularizer(cfg.loss.stability_lambda)
@@ -505,6 +627,8 @@ def main():
                 cfg.train.warmup_pct,
                 amp_dtype,
                 amp_enabled,
+                grad_accum,
+                grad_clip,
             )
             val_loss, val_rho, daily = evaluate(model, val_loader, loss_main, loss_stab, device, amp_dtype, amp_enabled, return_daily=True)
             mean = float(np.mean(daily)) if len(daily) else 0.0
