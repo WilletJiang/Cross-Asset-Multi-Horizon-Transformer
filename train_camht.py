@@ -217,7 +217,7 @@ def _make_optimizer(model: nn.Module, *, lr: float, weight_decay: float, device:
             index = device.index if device.index is not None else torch.cuda.current_device()
             major, _ = torch.cuda.get_device_capability(index)
             fused_ok = major >= 8
-        except Exception:  # noqa: BLE001
+        except RuntimeError:  # noqa: BLE001
             fused_ok = False
     if fused_ok:
         extra["fused"] = True
