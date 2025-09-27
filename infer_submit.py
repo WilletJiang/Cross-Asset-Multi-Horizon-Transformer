@@ -65,8 +65,8 @@ def main():
         for idx in range(num_dates):
             x = feature_tensor[idx].unsqueeze(0).unsqueeze(-1).to(device, non_blocking=True)
             times = time_grid.expand(1, num_assets, args.window, 1)
-            preds = model(x, times)
-            preds_np = [p.squeeze(0).float().cpu().numpy() for p in preds]
+            preds = model(x, times)  # [H, 1, A]
+            preds_np = preds[:, 0].float().cpu().numpy()  # [H, A]
             # 横截面 z-score 稳定秩序
             std_preds = [(p - p.mean()) / (p.std() + 1e-8) for p in preds_np]
             if clip > 0:
