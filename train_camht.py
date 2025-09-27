@@ -326,7 +326,7 @@ def evaluate(model, loader, loss_main, loss_stab, device, amp_dtype, amp_enabled
         preds_h0 = preds[0]
         # compute per-day rho within这个 batch（完全向量化处理缺失值）
         target = ys[0]
-        mask = ~torch.isnan(target)
+        mask = (~torch.isnan(target)) & (~torch.isnan(preds_h0))
         valid = mask.sum(dim=-1) >= 2
         fill_value = torch.finfo(preds_h0.dtype).min
         preds_masked = torch.where(mask, preds_h0, torch.full_like(preds_h0, fill_value))
