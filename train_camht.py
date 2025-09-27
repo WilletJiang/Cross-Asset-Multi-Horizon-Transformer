@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import random
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import polars as pl
@@ -180,6 +182,116 @@ class TargetsWindowDataset(torch.utils.data.Dataset):
         return x, times, ys, counts_list, batch_dates
 
 
+@dataclass(slots=True)
+class Batch:
+    features: torch.Tensor
+    times: torch.Tensor
+    labels: list[torch.Tensor]
+    counts: list[torch.Tensor]
+    dates: list[int]
+
+
+def _as_device_batch(
+    batch: Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], List[torch.Tensor], Sequence[int]],
+    device: torch.device,
+    *,
+    non_blocking: bool,
+) -> Batch:
+    x, times, ys, counts, dates = batch
+    features = x.to(device, non_blocking=non_blocking)
+    times = times.to(device, non_blocking=non_blocking)
+    labels = [y.to(device, non_blocking=non_blocking) for y in ys]
+    counts_dev = [c.to(device, non_blocking=non_blocking) for c in counts]
+    date_list = [int(d) for d in dates]
+    return Batch(features=features, times=times, labels=labels, counts=counts_dev, dates=date_list)
+
+
+class _CudaPrefetcher:
+    def __init__(self, loader: DataLoader, device: torch.device) -> None:
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+        self._iterator: Optional[Iterator] = None
+        self._next: Optional[Batch] = None
+
+    def __iter__(self) -> "_CudaPrefetcher":
+        self._iterator = iter(self.loader)
+        self._preload()
+        return self
+
+    def __next__(self) -> Batch:
+        if self._next is None:
+            raise StopIteration
+        torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
+        batch = self._next
+        self._preload()
+        return batch
+
+    def _preload(self) -> None:
+        assert self._iterator is not None
+        try:
+            batch = next(self._iterator)
+        except StopIteration:
+            self._next = None
+            return
+        with torch.cuda.stream(self.stream):
+            self._next = _as_device_batch(batch, self.device, non_blocking=True)
+
+
+def _iter_batches(
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    prefetch: bool,
+) -> Iterable[Batch]:
+    if device.type == "cuda" and prefetch:
+        return _CudaPrefetcher(loader, device)
+
+    non_blocking = device.type == "cuda"
+
+    def _generator() -> Iterator[Batch]:
+        for batch in loader:
+            yield _as_device_batch(batch, device, non_blocking=non_blocking)
+
+    return _generator()
+
+
+def _make_worker_init_fn(seed: int):
+    def _init(worker_id: int) -> None:
+        worker_seed = seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed % (2**32))
+        torch.manual_seed(worker_seed)
+
+    return _init
+
+
+def _build_loader(
+    dataset: TargetsWindowDataset,
+    indices: Optional[Sequence[int]],
+    cfg,
+    device: torch.device,
+) -> DataLoader:
+    subset = dataset if indices is None else dataset.view(indices)
+    num_workers = int(cfg.train.get("num_workers", 0))
+    pin_memory = bool(cfg.train.get("pin_memory", True)) and device.type == "cuda"
+    persistent = bool(cfg.train.get("persistent_workers", False)) and num_workers > 0
+    prefetch_factor = cfg.train.get("prefetch_factor")
+    loader_kwargs: Dict[str, object] = {
+        "batch_size": None,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        if persistent:
+            loader_kwargs["persistent_workers"] = True
+        if prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = int(prefetch_factor)
+        loader_kwargs["worker_init_fn"] = _make_worker_init_fn(int(cfg.seed))
+    return DataLoader(subset, **loader_kwargs)  # type: ignore[arg-type]
+
+
 def train_one_epoch(
     model,
     loader,
@@ -194,6 +306,9 @@ def train_one_epoch(
     warmup_pct,
     amp_dtype,
     amp_enabled,
+    grad_accum_steps,
+    grad_clip_norm,
+    prefetch_to_gpu,
 ):
     model.train()
     total_loss = 0.0
@@ -202,50 +317,53 @@ def train_one_epoch(
     steps_per_epoch = max(1, len(loader))
     total_steps = max(1, total_epochs * steps_per_epoch)
     base_step = epoch * steps_per_epoch
-    for step, (x, t, ys, counts, batch_dates) in enumerate(loader):
-        x = x.to(device)
-        t = t.to(device)
-        if x.dim() > 4 and x.shape[0] == 1:
-            x = x.squeeze(0)
-        if t.dim() > 4 and t.shape[0] == 1:
-            t = t.squeeze(0)
-        ys = [y.to(device) for y in ys]
-        ys = [y.squeeze(0) if y.dim() > 2 and y.shape[0] == 1 else y for y in ys]
-        counts = [c.to(device) for c in counts]
-        counts = [c.squeeze(0) if c.dim() > 1 and c.shape[0] == 1 else c for c in counts]
-        total_weight = sum(float(c.sum().item()) for c in counts)
-        if total_weight <= 0:
-            continue
+    accum_steps = max(1, int(grad_accum_steps))
+    clip_norm = float(grad_clip_norm) if grad_clip_norm is not None else 0.0
+    prefetch = bool(prefetch_to_gpu)
+    optimizer.zero_grad(set_to_none=True)
+    batch_iter = _iter_batches(loader, device, prefetch=prefetch)
+    for step, batch in enumerate(batch_iter):
         lr = cosine_scheduler(base_step + step, total_steps, lr_max, warmup_pct)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
-        optimizer.zero_grad(set_to_none=True)
+        counts_tensor = torch.stack([c.sum() for c in batch.counts]) if batch.counts else None
+        total_weight = float(counts_tensor.sum().item()) if counts_tensor is not None else 0.0
+        if total_weight <= 0:
+            continue
+        weights = (counts_tensor / total_weight).detach()
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            preds_list = model(x, t)
-            weighted_terms = []
-            for k in range(min(len(preds_list), len(counts))):
-                weight = float(counts[k].sum().item()) / total_weight
-                if weight <= 0:
-                    continue
-                loss_k = loss_main(preds_list[k], ys[k])
-                stab_k = loss_stab(preds_list[k], ys[k])
-                weighted_terms.append(weight * (loss_k + stab_k))
-            if not weighted_terms:
+            preds_list = model(batch.features, batch.times)
+            loss_terms = []
+            for idx, weight in enumerate(weights):
+                if idx >= len(preds_list) or idx >= len(batch.labels):
+                    break
+                loss_main_val = loss_main(preds_list[idx], batch.labels[idx])
+                loss_stab_val = loss_stab(preds_list[idx], batch.labels[idx])
+                loss_terms.append(weight * (loss_main_val + loss_stab_val))
+            if not loss_terms:
                 continue
-            loss = torch.stack(weighted_terms).sum()
+            raw_loss = torch.stack(loss_terms).sum()
+            loss = raw_loss / accum_steps
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+        should_step = ((step + 1) % accum_steps == 0) or (step + 1 == steps_per_epoch)
+        if should_step:
+            if scaler is not None and scaler.is_enabled():
+                scaler.unscale_(optimizer)
+                if clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():
-            total_loss += loss.item()
-            total_rho += spearman_rho(preds_list[0], ys[0]).item()
+            total_loss += raw_loss.detach().item()
+            total_rho += spearman_rho(preds_list[0], batch.labels[0]).item()
             steps += 1
     if steps == 0:
         return 0.0, 0.0
@@ -253,40 +371,42 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model, loader, loss_main, loss_stab, device, amp_dtype, amp_enabled, return_daily: bool = False):
+def evaluate(
+    model,
+    loader,
+    loss_main,
+    loss_stab,
+    device,
+    amp_dtype,
+    amp_enabled,
+    prefetch_to_gpu,
+    return_daily: bool = False,
+):
     model.eval()
     total_loss = 0.0
     total_rho = 0.0
     steps = 0
     daily_rhos: list[float] = []
-    for x, t, ys, counts, batch_dates in loader:
-        x = x.to(device)
-        t = t.to(device)
-        if x.dim() > 4 and x.shape[0] == 1:
-            x = x.squeeze(0)
-        if t.dim() > 4 and t.shape[0] == 1:
-            t = t.squeeze(0)
-        ys = [y.to(device) for y in ys]
-        ys = [y.squeeze(0) if y.dim() > 2 and y.shape[0] == 1 else y for y in ys]
-        counts = [c.to(device) for c in counts]
-        counts = [c.squeeze(0) if c.dim() > 1 and c.shape[0] == 1 else c for c in counts]
-        total_weight = sum(float(c.sum().item()) for c in counts)
+    prefetch = bool(prefetch_to_gpu)
+    for batch in _iter_batches(loader, device, prefetch=prefetch):
+        counts_tensor = torch.stack([c.sum() for c in batch.counts]) if batch.counts else None
+        total_weight = float(counts_tensor.sum().item()) if counts_tensor is not None else 0.0
         if total_weight <= 0:
             continue
+        weights = (counts_tensor / total_weight).detach()
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            preds_list = model(x, t)
+            preds_list = model(batch.features, batch.times)
         loss_val = 0.0
-        for k in range(min(len(preds_list), len(counts))):
-            weight = float(counts[k].sum().item()) / total_weight
-            if weight <= 0:
-                continue
-            loss_val += weight * (
-                loss_main(preds_list[k], ys[k]).item() + loss_stab(preds_list[k], ys[k]).item()
-            )
+        for idx, weight in enumerate(weights):
+            if idx >= len(preds_list) or idx >= len(batch.labels):
+                break
+            main_val = loss_main(preds_list[idx], batch.labels[idx]).item()
+            stab_val = loss_stab(preds_list[idx], batch.labels[idx]).item()
+            loss_val += float(weight.item()) * (main_val + stab_val)
         total_loss += loss_val
         preds = preds_list[0]
         # compute per-day rho within这个 batch（完全向量化处理缺失值）
-        target = ys[0]
+        target = batch.labels[0]
         mask = ~torch.isnan(target)
         valid = mask.sum(dim=-1) >= 2
         fill_value = torch.finfo(preds.dtype).min
@@ -340,10 +460,16 @@ def main():
     amp_dtype = _resolve_amp_dtype(cfg.train.get("amp_dtype", "auto"))
     amp_enabled = bool(cfg.train.amp) and device.type == "cuda"
 
-    dataset, date_list = build_datasets(cfg)
+    dataset, _ = build_datasets(cfg)
+    max_train_dates = cfg.cv.get("max_train_dates")
+    if max_train_dates is not None:
+        max_train_dates = int(max_train_dates)
+        if max_train_dates > 0 and dataset.indices.numel() > max_train_dates:
+            keep = torch.arange(dataset.indices.numel() - max_train_dates, dataset.indices.numel())
+            dataset = dataset.view(keep.tolist())
 
-    def subset(ds: TargetsWindowDataset, idxs):
-        return ds.view(idxs)
+    active_indices = dataset.indices.to(torch.long)
+    active_dates = dataset.dates.index_select(0, active_indices).tolist()
 
     ckpt_dir = Path(cfg.train.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -353,16 +479,19 @@ def main():
     all_snapshots: list[Path] = []
     best_global_score = -1e9
     best_global_path: Path | None = None
+    prefetch_to_gpu = bool(cfg.train.get("prefetch_to_gpu", device.type == "cuda"))
+    grad_accum_steps = int(cfg.train.get("grad_accum", 1))
+    grad_clip_cfg = cfg.train.get("grad_clip_norm", 0.0)
+    grad_clip_norm = float(grad_clip_cfg) if grad_clip_cfg is not None else 0.0
 
     if use_cpcv:
         # CPCV outer loop
-        dates = dataset.dates.tolist()
         from camht.cpcv import CPCVSpec, cpcv_splits
 
         spec = CPCVSpec(n_splits=int(cfg.cv.n_splits), embargo_days=int(cfg.cv.embargo_days))
-        for fold_id, (tr_idx, te_idx) in enumerate(cpcv_splits(dates, spec)):
-            train_loader = DataLoader(subset(dataset, tr_idx), batch_size=1, shuffle=False, num_workers=0)
-            val_loader = DataLoader(subset(dataset, te_idx), batch_size=1, shuffle=False, num_workers=0)
+        for fold_id, (tr_idx, te_idx) in enumerate(cpcv_splits(active_dates, spec)):
+            train_loader = _build_loader(dataset, tr_idx.tolist(), cfg, device)
+            val_loader = _build_loader(dataset, te_idx.tolist(), cfg, device)
 
             model = CAMHT(
                 in_channels=1,
@@ -414,8 +543,21 @@ def main():
                     cfg.train.warmup_pct,
                     amp_dtype,
                     amp_enabled,
+                    grad_accum_steps,
+                    grad_clip_norm,
+                    prefetch_to_gpu,
                 )
-                val_loss, val_rho, daily = evaluate(model, val_loader, loss_main, loss_stab, device, amp_dtype, amp_enabled, return_daily=True)
+                val_loss, val_rho, daily = evaluate(
+                    model,
+                    val_loader,
+                    loss_main,
+                    loss_stab,
+                    device,
+                    amp_dtype,
+                    amp_enabled,
+                    prefetch_to_gpu,
+                    return_daily=True,
+                )
                 mean = float(np.mean(daily)) if len(daily) else 0.0
                 std = float(np.std(daily) + 1e-6)
                 sharpe_like = mean / std if std > 0 else 0.0
@@ -450,12 +592,12 @@ def main():
             shutil.copy2(best_global_path, final_path)
     else:
         # Simple holdout
-        n = dataset.dates.numel()
+        n = dataset.indices.numel()
         val_cut = int(n * (1 - cfg.cv.test_size_fraction))
         train_dates_idx = list(range(0, val_cut))
         val_dates_idx = list(range(val_cut, n))
-        train_loader = DataLoader(subset(dataset, train_dates_idx), batch_size=1, shuffle=False, num_workers=0)
-        val_loader = DataLoader(subset(dataset, val_dates_idx), batch_size=1, shuffle=False, num_workers=0)
+        train_loader = _build_loader(dataset, train_dates_idx, cfg, device)
+        val_loader = _build_loader(dataset, val_dates_idx, cfg, device)
 
         model = CAMHT(
             in_channels=1,
@@ -505,8 +647,21 @@ def main():
                 cfg.train.warmup_pct,
                 amp_dtype,
                 amp_enabled,
+                grad_accum_steps,
+                grad_clip_norm,
+                prefetch_to_gpu,
             )
-            val_loss, val_rho, daily = evaluate(model, val_loader, loss_main, loss_stab, device, amp_dtype, amp_enabled, return_daily=True)
+            val_loss, val_rho, daily = evaluate(
+                model,
+                val_loader,
+                loss_main,
+                loss_stab,
+                device,
+                amp_dtype,
+                amp_enabled,
+                prefetch_to_gpu,
+                return_daily=True,
+            )
             mean = float(np.mean(daily)) if len(daily) else 0.0
             std = float(np.std(daily) + 1e-6)
             sharpe_like = mean / std if std > 0 else 0.0
