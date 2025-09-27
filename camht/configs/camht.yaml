@@ -24,11 +24,11 @@ model:
   time2vec_dim: 8
   use_flash_attn: true
   use_compile: true
-  cross_group_size: 0  # >0 启用跨资产分组注意力（每组大小），避免 token 爆炸
+  cross_group_size: 16  # Ampere friendly：减小跨资产 token 数，提升吞吐
 
 train:
   epochs: 30
-  batch_days: 8  # number of days per batch (assets form the second dimension)
+  batch_days: 12  # 24GB 3090 可承受更大的日批量
   grad_accum: 1
   lr_max: 0.0015
   weight_decay: 0.05
@@ -38,9 +38,10 @@ train:
   checkpoint_dir: checkpoints
   save_every: 1
   early_stop_patience: 5
-  grad_checkpointing: true
+  grad_checkpointing: false
   use_pretrain: true
   pretrain_ckpt: checkpoints/timae_encoder.ckpt
+  amp_dtype: auto  # auto => bf16(支持时) / 否则 fp16
 
 loss:
   diffsort_temperature: 0.1

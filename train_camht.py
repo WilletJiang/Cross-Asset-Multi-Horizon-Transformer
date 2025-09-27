@@ -24,6 +24,22 @@ from camht.targets import TargetDef, compute_pair_series, compute_target_matrix,
 from camht.utils import SDPPolicy, configure_sdp, console, get_device, maybe_compile, set_seed
 
 
+def _resolve_amp_dtype(cfg_value: str | None) -> torch.dtype:
+    if cfg_value is None or str(cfg_value).lower() == "auto":
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+    value = str(cfg_value).lower()
+    if value in {"bf16", "bfloat16"}:
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        console.print("[yellow]Requested bf16 AMP but device不支持，自动改用 float16")
+        return torch.float16
+    if value in {"fp16", "float16"}:
+        return torch.float16
+    raise ValueError(f"Unsupported amp_dtype: {cfg_value}")
+
+
 def cosine_scheduler(t: int, T: int, lr_max: float, warmup_pct: float) -> float:
     warmup = max(1, int(T * warmup_pct))
     if t < warmup:
@@ -36,19 +52,56 @@ def build_datasets(cfg):
     train, _ = load_frames(cfg.data.train_csv, cfg.data.labels_csv, cfg.data.date_column)
     target_defs = parse_target_pairs(cfg.data.target_pairs_csv)
 
-    # Compute per-target series from train.csv
+    # Compute per-target price series from train.csv（用于特征窗口）
     series_df, order = compute_target_matrix(train, cfg.data.date_column, target_defs)
 
     # Derive multi-horizon labels from series_df (percentage returns)
-    # y_k[date] = s_{date+k}/s_{date} - 1
+    # 对齐目标定义：使用 log-return
     date_col = cfg.data.date_column
     base = series_df.sort(date_col)
-    targets_only = base.drop(date_col)
-    Ys = {}
-    for k in [1, 2, 3, 4]:
-        shifted = targets_only.select(pl.all().shift(-k))
-        y = (shifted - targets_only) / (targets_only.abs() + 1e-12)
-        Ys[k] = pl.DataFrame({date_col: base[date_col]}).with_columns(y)
+    horizons = [1, 2, 3, 4]
+
+    # 预取所需基础资产列，计算 log-price，再组合成目标 log-return
+    eps = 1e-6
+    price_cols: set[str] = set()
+    for tdef in target_defs.values():
+        expr = tdef.expr
+        if "-" in expr:
+            left, right = [s.strip() for s in expr.split("-")]
+            price_cols.add(left)
+            price_cols.add(right)
+        else:
+            price_cols.add(expr.strip())
+    price_cols = sorted(price_cols)
+    train_sorted = train.sort(date_col)
+    price_mat = train_sorted.select(price_cols).to_numpy()
+    price_mat = np.clip(price_mat.astype(np.float64), eps, None)
+    log_prices = np.log(price_mat)
+    col_to_idx = {col: idx for idx, col in enumerate(price_cols)}
+
+    log_returns_by_h = {}
+    n_dates = log_prices.shape[0]
+    for k in horizons:
+        diff = np.full_like(log_prices, np.nan)
+        if k < n_dates:
+            diff[:-k, :] = log_prices[k:, :] - log_prices[:-k, :]
+        log_returns_by_h[k] = diff
+
+    label_tensors = []
+    for k in horizons:
+        horizon_returns = []
+        diff = log_returns_by_h[k]
+        for target_name in order:
+            expr = target_defs[target_name].expr
+            if "-" in expr:
+                left, right = [s.strip() for s in expr.split("-")]
+                ret = diff[:, col_to_idx[left]] - diff[:, col_to_idx[right]]
+            else:
+                ret = diff[:, col_to_idx[expr.strip()]]
+            horizon_returns.append(ret.astype(np.float32))
+        horizon_stack = np.stack(horizon_returns, axis=1)  # [D, A]
+        label_tensors.append(horizon_stack)
+    labels_tensor_np = np.stack(label_tensors, axis=0)  # [H, D, A]
 
     values = base.drop(date_col).to_numpy()
     dates = base[date_col].to_numpy()
@@ -57,12 +110,7 @@ def build_datasets(cfg):
     feature_tensor = torch.from_numpy(features)  # [D, A, W]
     time_grid = torch.linspace(0.0, 1.0, cfg.data.window, dtype=torch.float32).view(1, 1, cfg.data.window, 1)
 
-    horizons = [1, 2, 3, 4]
-    label_tensors = []
-    for k in horizons:
-        arr = Ys[k].drop(date_col).to_numpy()
-        label_tensors.append(torch.from_numpy(arr.astype(np.float32)))
-    labels_tensor = torch.stack(label_tensors, dim=0)  # [H, D, A]
+    labels_tensor = torch.from_numpy(labels_tensor_np)
 
     dataset = TargetsWindowDataset(
         features=feature_tensor,
@@ -126,11 +174,27 @@ class TargetsWindowDataset(torch.utils.data.Dataset):
         times = self.time_grid.expand(x.shape[0], self.num_assets, self.window, 1)
         y_block = self.labels.index_select(1, sel)  # [H, B, A]
         ys = list(y_block.unbind(0))
+        counts = (~torch.isnan(y_block)).sum(dim=-1).float()
+        counts_list = list(counts.unbind(0))
         batch_dates = self.dates.index_select(0, sel).tolist()
-        return x, times, ys, batch_dates
+        return x, times, ys, counts_list, batch_dates
 
 
-def train_one_epoch(model, loader, optimizer, scaler, loss_main, loss_stab, device, epoch, total_epochs, lr_max, warmup_pct):
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    scaler,
+    loss_main,
+    loss_stab,
+    device,
+    epoch,
+    total_epochs,
+    lr_max,
+    warmup_pct,
+    amp_dtype,
+    amp_enabled,
+):
     model.train()
     total_loss = 0.0
     total_rho = 0.0
@@ -138,24 +202,38 @@ def train_one_epoch(model, loader, optimizer, scaler, loss_main, loss_stab, devi
     steps_per_epoch = max(1, len(loader))
     total_steps = max(1, total_epochs * steps_per_epoch)
     base_step = epoch * steps_per_epoch
-    for step, (x, t, ys, batch_dates) in enumerate(loader):
+    for step, (x, t, ys, counts, batch_dates) in enumerate(loader):
         x = x.to(device)
         t = t.to(device)
+        if x.dim() > 4 and x.shape[0] == 1:
+            x = x.squeeze(0)
+        if t.dim() > 4 and t.shape[0] == 1:
+            t = t.squeeze(0)
         ys = [y.to(device) for y in ys]
+        ys = [y.squeeze(0) if y.dim() > 2 and y.shape[0] == 1 else y for y in ys]
+        counts = [c.to(device) for c in counts]
+        counts = [c.squeeze(0) if c.dim() > 1 and c.shape[0] == 1 else c for c in counts]
+        total_weight = sum(float(c.sum().item()) for c in counts)
+        if total_weight <= 0:
+            continue
         lr = cosine_scheduler(base_step + step, total_steps, lr_max, warmup_pct)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=scaler is not None):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             preds_list = model(x, t)
-            # multi-horizon joint loss
-            losses = []
-            stabs = []
-            for k in range(min(4, len(preds_list))):
-                losses.append(loss_main(preds_list[k], ys[k]))
-                stabs.append(loss_stab(preds_list[k], ys[k]))
-            loss = torch.stack(losses).mean() + torch.stack(stabs).mean()
-        if scaler is not None:
+            weighted_terms = []
+            for k in range(min(len(preds_list), len(counts))):
+                weight = float(counts[k].sum().item()) / total_weight
+                if weight <= 0:
+                    continue
+                loss_k = loss_main(preds_list[k], ys[k])
+                stab_k = loss_stab(preds_list[k], ys[k])
+                weighted_terms.append(weight * (loss_k + stab_k))
+            if not weighted_terms:
+                continue
+            loss = torch.stack(weighted_terms).sum()
+        if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -169,26 +247,44 @@ def train_one_epoch(model, loader, optimizer, scaler, loss_main, loss_stab, devi
             total_loss += loss.item()
             total_rho += spearman_rho(preds_list[0], ys[0]).item()
             steps += 1
-    return total_loss / max(1, steps), total_rho / max(1, steps)
+    if steps == 0:
+        return 0.0, 0.0
+    return total_loss / steps, total_rho / steps
 
 
 @torch.no_grad()
-def evaluate(model, loader, loss_main, loss_stab, device, return_daily: bool = False):
+def evaluate(model, loader, loss_main, loss_stab, device, amp_dtype, amp_enabled, return_daily: bool = False):
     model.eval()
     total_loss = 0.0
     total_rho = 0.0
     steps = 0
     daily_rhos: list[float] = []
-    for x, t, ys, batch_dates in loader:
+    for x, t, ys, counts, batch_dates in loader:
         x = x.to(device)
         t = t.to(device)
+        if x.dim() > 4 and x.shape[0] == 1:
+            x = x.squeeze(0)
+        if t.dim() > 4 and t.shape[0] == 1:
+            t = t.squeeze(0)
         ys = [y.to(device) for y in ys]
-        preds_list = model(x, t)
-        loss = 0.0
-        for k in range(min(4, len(preds_list))):
-            loss = loss + loss_main(preds_list[k], ys[k]) + loss_stab(preds_list[k], ys[k])
+        ys = [y.squeeze(0) if y.dim() > 2 and y.shape[0] == 1 else y for y in ys]
+        counts = [c.to(device) for c in counts]
+        counts = [c.squeeze(0) if c.dim() > 1 and c.shape[0] == 1 else c for c in counts]
+        total_weight = sum(float(c.sum().item()) for c in counts)
+        if total_weight <= 0:
+            continue
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            preds_list = model(x, t)
+        loss_val = 0.0
+        for k in range(min(len(preds_list), len(counts))):
+            weight = float(counts[k].sum().item()) / total_weight
+            if weight <= 0:
+                continue
+            loss_val += weight * (
+                loss_main(preds_list[k], ys[k]).item() + loss_stab(preds_list[k], ys[k]).item()
+            )
+        total_loss += loss_val
         preds = preds_list[0]
-        total_loss += loss.item()
         # compute per-day rho within这个 batch（完全向量化处理缺失值）
         target = ys[0]
         mask = ~torch.isnan(target)
@@ -201,15 +297,15 @@ def evaluate(model, loader, loss_main, loss_stab, device, return_daily: bool = F
         rank_preds = torch.where(mask, rank_preds, torch.zeros_like(rank_preds))
         rank_target = torch.where(mask, rank_target, torch.zeros_like(rank_target))
         mask_f = mask.to(preds.dtype)
-        counts = mask.sum(dim=-1).clamp_min(1).float()
-        mean_p = (rank_preds * mask_f).sum(dim=-1, keepdim=True) / counts
-        mean_t = (rank_target * mask_f).sum(dim=-1, keepdim=True) / counts
+        valid_counts = mask.sum(dim=-1).clamp_min(1).float()
+        mean_p = (rank_preds * mask_f).sum(dim=-1, keepdim=True) / valid_counts
+        mean_t = (rank_target * mask_f).sum(dim=-1, keepdim=True) / valid_counts
         xc = (rank_preds - mean_p) * mask_f
         yc = (rank_target - mean_t) * mask_f
         eps = 1e-8
-        cov = (xc * yc).sum(dim=-1) / counts.squeeze(-1)
-        var_p = (xc.pow(2).sum(dim=-1) / counts.squeeze(-1)).clamp_min(eps)
-        var_t = (yc.pow(2).sum(dim=-1) / counts.squeeze(-1)).clamp_min(eps)
+        cov = (xc * yc).sum(dim=-1) / valid_counts.squeeze(-1)
+        var_p = (xc.pow(2).sum(dim=-1) / valid_counts.squeeze(-1)).clamp_min(eps)
+        var_t = (yc.pow(2).sum(dim=-1) / valid_counts.squeeze(-1)).clamp_min(eps)
         rho_day = cov / (var_p.sqrt() * var_t.sqrt() + eps)
         valid_rho = rho_day[valid]
         if return_daily:
@@ -217,9 +313,13 @@ def evaluate(model, loader, loss_main, loss_stab, device, return_daily: bool = F
         batch_mean_rho = valid_rho.mean().item() if valid_rho.numel() > 0 else 0.0
         total_rho += batch_mean_rho
         steps += 1
+    if steps == 0:
+        if return_daily:
+            return 0.0, 0.0, []
+        return 0.0, 0.0
     if return_daily:
-        return total_loss / max(1, steps), total_rho / max(1, steps), daily_rhos
-    return total_loss / max(1, steps), total_rho / max(1, steps)
+        return total_loss / steps, total_rho / steps, daily_rhos
+    return total_loss / steps, total_rho / steps
 
 
 def main():
@@ -231,6 +331,14 @@ def main():
     set_seed(cfg.seed)
     configure_sdp(SDPPolicy())
     device = get_device()
+
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("medium")
+
+    amp_dtype = _resolve_amp_dtype(cfg.train.get("amp_dtype", "auto"))
+    amp_enabled = bool(cfg.train.amp) and device.type == "cuda"
 
     dataset, date_list = build_datasets(cfg)
 
@@ -283,7 +391,7 @@ def main():
                 except Exception as e:  # noqa: BLE001
                     console.print(f"[yellow]Pretrain load failed: {e}")
             opt = optim.AdamW(model.parameters(), lr=cfg.train.lr_max, weight_decay=cfg.train.weight_decay)
-            scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg.train.amp))
+            scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
             loss_main = DiffSpearmanLoss(cfg.loss.diffsort_temperature, cfg.loss.diffsort_regularization)
             loss_stab = StabilityRegularizer(cfg.loss.stability_lambda)
 
@@ -293,9 +401,21 @@ def main():
             wait = 0
             for epoch in range(cfg.train.epochs):
                 train_loss, train_rho = train_one_epoch(
-                    model, train_loader, opt, scaler, loss_main, loss_stab, device, epoch, cfg.train.epochs, cfg.train.lr_max, cfg.train.warmup_pct
+                    model,
+                    train_loader,
+                    opt,
+                    scaler,
+                    loss_main,
+                    loss_stab,
+                    device,
+                    epoch,
+                    cfg.train.epochs,
+                    cfg.train.lr_max,
+                    cfg.train.warmup_pct,
+                    amp_dtype,
+                    amp_enabled,
                 )
-                val_loss, val_rho, daily = evaluate(model, val_loader, loss_main, loss_stab, device, return_daily=True)
+                val_loss, val_rho, daily = evaluate(model, val_loader, loss_main, loss_stab, device, amp_dtype, amp_enabled, return_daily=True)
                 mean = float(np.mean(daily)) if len(daily) else 0.0
                 std = float(np.std(daily) + 1e-6)
                 sharpe_like = mean / std if std > 0 else 0.0
@@ -363,7 +483,7 @@ def main():
             except Exception as e:  # noqa: BLE001
                 console.print(f"[yellow]Pretrain load failed: {e}")
         opt = optim.AdamW(model.parameters(), lr=cfg.train.lr_max, weight_decay=cfg.train.weight_decay)
-        scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg.train.amp))
+        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
         loss_main = DiffSpearmanLoss(cfg.loss.diffsort_temperature, cfg.loss.diffsort_regularization)
         loss_stab = StabilityRegularizer(cfg.loss.stability_lambda)
 
@@ -372,9 +492,21 @@ def main():
         wait = 0
         for epoch in range(cfg.train.epochs):
             train_loss, train_rho = train_one_epoch(
-                model, train_loader, opt, scaler, loss_main, loss_stab, device, epoch, cfg.train.epochs, cfg.train.lr_max, cfg.train.warmup_pct
+                model,
+                train_loader,
+                opt,
+                scaler,
+                loss_main,
+                loss_stab,
+                device,
+                epoch,
+                cfg.train.epochs,
+                cfg.train.lr_max,
+                cfg.train.warmup_pct,
+                amp_dtype,
+                amp_enabled,
             )
-            val_loss, val_rho, daily = evaluate(model, val_loader, loss_main, loss_stab, device, return_daily=True)
+            val_loss, val_rho, daily = evaluate(model, val_loader, loss_main, loss_stab, device, amp_dtype, amp_enabled, return_daily=True)
             mean = float(np.mean(daily)) if len(daily) else 0.0
             std = float(np.std(daily) + 1e-6)
             sharpe_like = mean / std if std > 0 else 0.0
