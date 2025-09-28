@@ -1,4 +1,4 @@
-torch>=2.5.1  # Hopper(H800)/Blackwell(5090) 需要CUDA 12.3+ 构建
+torch>=2.7.0  # Hopper(H800)/Blackwell(5090) 需要CUDA 12.3+ 构建
 polars>=0.20
 numpy>=1.24
 pandas>=2.0
