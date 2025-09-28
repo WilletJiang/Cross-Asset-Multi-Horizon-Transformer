@@ -162,12 +162,20 @@ class CAMHTBackbone(nn.Module):
 class HorizonHeads(nn.Module):
     def __init__(self, d_model: int, n_horizons: int = 4):
         super().__init__()
-        self.out = nn.ModuleList([nn.Linear(d_model, 1) for _ in range(n_horizons)])
+        self.proj = nn.Linear(d_model, n_horizons)
 
-    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
-        # x: [B, A, D]
-        outs = [head(x).squeeze(-1) for head in self.out]  # each: [B, A]
-        return outs
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Project backbone features to multi-horizon targets.
+
+        Args:
+            x: [B, A, D]
+
+        Returns:
+            Tensor shaped [H, B, A]. The layout keeps horizon as leading
+            dimension to simplify loss reduction across horizons.
+        """
+        out = self.proj(x)  # [B, A, H]
+        return out.movedim(-1, 0).contiguous()
 
 
 class CAMHT(nn.Module):
@@ -206,6 +214,6 @@ class CAMHT(nn.Module):
         )
         self.heads = HorizonHeads(d_model, n_horizons)
 
-    def forward(self, x: torch.Tensor, times: torch.Tensor) -> list[torch.Tensor]:
+    def forward(self, x: torch.Tensor, times: torch.Tensor) -> torch.Tensor:
         feat = self.backbone(x, times)  # [B, A, D]
         return self.heads(feat)

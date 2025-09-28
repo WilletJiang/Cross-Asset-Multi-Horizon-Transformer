@@ -3,10 +3,8 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import random
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import polars as pl
@@ -139,11 +137,12 @@ class TargetsWindowDataset(torch.utils.data.Dataset):
     ) -> None:
         if features.ndim != 3:
             raise ValueError("features must be [D, A, W]")
-        self.features = features.float()
-        self.labels = labels.float()  # [H, D, A]
-        self.dates = dates.long()
-        self.batch_days = batch_days
-        self.time_grid = time_grid.float()
+        self.features = features.float().contiguous()
+        self.labels = labels.float().contiguous()  # [H, D, A]
+        self.label_mask = (~torch.isnan(self.labels)).to(torch.bool)
+        self.dates = dates.long().contiguous()
+        self.batch_days = int(batch_days)
+        self.time_grid = time_grid.float().contiguous()
         total = features.shape[0]
         base_idx = torch.arange(total, dtype=torch.long)
         self.indices = base_idx if indices is None else base_idx.index_select(0, indices.long())
@@ -172,98 +171,27 @@ class TargetsWindowDataset(torch.utils.data.Dataset):
         end = min(self.indices.numel(), start + self.batch_days)
         sel = self.indices[start:end]
         # 全部 tensor 操作，无 Python 循环，保持 torch.compile 友好
-        x = self.features.index_select(0, sel).unsqueeze(-1)  # [B, A, W, 1]
+        x = self.features.index_select(0, sel).unsqueeze(-1).contiguous()  # [B, A, W, 1]
         times = self.time_grid.expand(x.shape[0], self.num_assets, self.window, 1)
-        y_block = self.labels.index_select(1, sel)  # [H, B, A]
-        ys = list(y_block.unbind(0))
-        counts = (~torch.isnan(y_block)).sum(dim=-1).float()
-        counts_list = list(counts.unbind(0))
-        batch_dates = self.dates.index_select(0, sel).tolist()
-        return x, times, ys, counts_list, batch_dates
+        y_block = self.labels.index_select(1, sel).contiguous()  # [H, B, A]
+        mask_block = self.label_mask.index_select(1, sel)
+        counts = mask_block.sum(dim=-1).float().contiguous()  # [H, B]
+        batch_dates = self.dates.index_select(0, sel)
+        return x, times, y_block, counts, batch_dates
 
 
-@dataclass(slots=True)
-class Batch:
-    features: torch.Tensor
-    times: torch.Tensor
-    labels: list[torch.Tensor]
-    counts: list[torch.Tensor]
-    dates: list[int]
+def _passthrough_collate(batch):
+    if len(batch) != 1:
+        raise ValueError("TargetsWindowDataset expects batch_size=1 in DataLoader")
+    return batch[0]
 
 
-def _as_device_batch(
-    batch: Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], List[torch.Tensor], Sequence[int]],
-    device: torch.device,
-    *,
-    non_blocking: bool,
-) -> Batch:
-    x, times, ys, counts, dates = batch
-    features = x.to(device, non_blocking=non_blocking)
-    times = times.to(device, non_blocking=non_blocking)
-    labels = [y.to(device, non_blocking=non_blocking) for y in ys]
-    counts_dev = [c.to(device, non_blocking=non_blocking) for c in counts]
-    date_list = [int(d) for d in dates]
-    return Batch(features=features, times=times, labels=labels, counts=counts_dev, dates=date_list)
-
-
-class _CudaPrefetcher:
-    def __init__(self, loader: DataLoader, device: torch.device) -> None:
-        self.loader = loader
-        self.device = device
-        self.stream = torch.cuda.Stream(device=device)
-        self._iterator: Optional[Iterator] = None
-        self._next: Optional[Batch] = None
-
-    def __iter__(self) -> "_CudaPrefetcher":
-        self._iterator = iter(self.loader)
-        self._preload()
-        return self
-
-    def __next__(self) -> Batch:
-        if self._next is None:
-            raise StopIteration
-        torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
-        batch = self._next
-        self._preload()
-        return batch
-
-    def _preload(self) -> None:
-        assert self._iterator is not None
-        try:
-            batch = next(self._iterator)
-        except StopIteration:
-            self._next = None
-            return
-        with torch.cuda.stream(self.stream):
-            self._next = _as_device_batch(batch, self.device, non_blocking=True)
-
-
-def _iter_batches(
-    loader: DataLoader,
-    device: torch.device,
-    *,
-    prefetch: bool,
-) -> Iterable[Batch]:
-    if device.type == "cuda" and prefetch:
-        return _CudaPrefetcher(loader, device)
-
-    non_blocking = device.type == "cuda"
-
-    def _generator() -> Iterator[Batch]:
-        for batch in loader:
-            yield _as_device_batch(batch, device, non_blocking=non_blocking)
-
-    return _generator()
-
-
-def _make_worker_init_fn(seed: int):
-    def _init(worker_id: int) -> None:
-        worker_seed = seed + worker_id
-        random.seed(worker_seed)
-        np.random.seed(worker_seed % (2**32))
-        torch.manual_seed(worker_seed)
-
-    return _init
+def _suggest_worker_count(device: torch.device) -> int:
+    if device.type != "cuda":
+        return 0
+    cpu_count = os.cpu_count() or 1
+    # Use half of logical cores to avoid host saturation while keeping the GPU fed.
+    return max(1, cpu_count // 2)
 
 
 def _normalize_loader_section(section: object) -> Dict[str, object]:
@@ -285,7 +213,6 @@ def _resolve_loader_options(cfg, role: str) -> Dict[str, object]:
         "persistent_workers",
         "prefetch_factor",
         "pin_memory_device",
-        "prefetch_to_gpu",
     )
     options: Dict[str, object] = {}
     for key in keys:
@@ -305,35 +232,57 @@ def _resolve_loader_options(cfg, role: str) -> Dict[str, object]:
 
 def _build_loader(
     dataset: TargetsWindowDataset,
-    indices: Optional[Sequence[int]],
+    device: torch.device,
     *,
     loader_cfg: Dict[str, object],
-    seed: int,
-    device: torch.device,
 ) -> DataLoader:
-    subset = dataset if indices is None else dataset.view(indices)
-    num_workers = int(loader_cfg.get("num_workers", 0) or 0)
+    suggested_workers = _suggest_worker_count(device)
+    num_workers = loader_cfg.get("num_workers")
+    if num_workers is None:
+        num_workers = suggested_workers
+    num_workers = int(max(0, int(num_workers)))
     pin_memory_default = device.type == "cuda"
     pin_memory = bool(loader_cfg.get("pin_memory", pin_memory_default)) and device.type == "cuda"
     persistent_default = num_workers > 0
-    persistent = bool(loader_cfg.get("persistent_workers", persistent_default)) and num_workers > 0
+    persistent_workers = bool(loader_cfg.get("persistent_workers", persistent_default)) and num_workers > 0
     prefetch_factor = loader_cfg.get("prefetch_factor")
+    if prefetch_factor is None and num_workers > 0:
+        prefetch_factor = 4
     pin_memory_device = loader_cfg.get("pin_memory_device")
+
     loader_kwargs: Dict[str, object] = {
-        "batch_size": None,
+        "batch_size": 1,
         "shuffle": False,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
+        "collate_fn": _passthrough_collate,
     }
     if num_workers > 0:
-        if persistent:
+        if persistent_workers:
             loader_kwargs["persistent_workers"] = True
         if prefetch_factor is not None:
             loader_kwargs["prefetch_factor"] = int(prefetch_factor)
-        loader_kwargs["worker_init_fn"] = _make_worker_init_fn(int(seed))
     if pin_memory and pin_memory_device:
         loader_kwargs["pin_memory_device"] = str(pin_memory_device)
-    return DataLoader(subset, **loader_kwargs)  # type: ignore[arg-type]
+    return DataLoader(dataset, **loader_kwargs)
+
+
+def _make_optimizer(model: nn.Module, *, lr: float, weight_decay: float, device: torch.device) -> optim.Optimizer:
+    extra: Dict[str, object] = {}
+    fused_ok = False
+    if device.type == "cuda" and torch.cuda.is_available():
+        try:
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            major, _ = torch.cuda.get_device_capability(index)
+            fused_ok = major >= 8
+        except Exception:  # noqa: BLE001
+            fused_ok = False
+    if fused_ok:
+        extra["fused"] = True
+    try:
+        return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, **extra)
+    except TypeError:
+        return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
 
 def train_one_epoch(
@@ -350,9 +299,6 @@ def train_one_epoch(
     warmup_pct,
     amp_dtype,
     amp_enabled,
-    grad_accum_steps,
-    grad_clip_norm,
-    prefetch_to_gpu,
 ):
     model.train()
     total_loss = 0.0
@@ -361,53 +307,46 @@ def train_one_epoch(
     steps_per_epoch = max(1, len(loader))
     total_steps = max(1, total_epochs * steps_per_epoch)
     base_step = epoch * steps_per_epoch
-    accum_steps = max(1, int(grad_accum_steps))
-    clip_norm = float(grad_clip_norm) if grad_clip_norm is not None else 0.0
-    prefetch = bool(prefetch_to_gpu)
-    optimizer.zero_grad(set_to_none=True)
-    batch_iter = _iter_batches(loader, device, prefetch=prefetch)
-    for step, batch in enumerate(batch_iter):
+    for step, (x, t, ys, counts, batch_dates) in enumerate(loader):
+        x = x.to(device=device, non_blocking=True)
+        t = t.to(device=device, non_blocking=True)
+        ys = ys.to(device=device, non_blocking=True)
+        counts = counts.float()
+        per_horizon_weight = counts.sum(dim=-1)
+        total_weight = float(per_horizon_weight.sum().item())
+        if total_weight <= 0:
+            continue
         lr = cosine_scheduler(base_step + step, total_steps, lr_max, warmup_pct)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
-        counts_tensor = torch.stack([c.sum() for c in batch.counts]) if batch.counts else None
-        total_weight = float(counts_tensor.sum().item()) if counts_tensor is not None else 0.0
-        if total_weight <= 0:
-            continue
-        weights = (counts_tensor / total_weight).detach()
+        optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            preds_list = model(batch.features, batch.times)
-            loss_terms = []
-            for idx, weight in enumerate(weights):
-                if idx >= len(preds_list) or idx >= len(batch.labels):
-                    break
-                loss_main_val = loss_main(preds_list[idx], batch.labels[idx])
-                loss_stab_val = loss_stab(preds_list[idx], batch.labels[idx])
-                loss_terms.append(weight * (loss_main_val + loss_stab_val))
-            if not loss_terms:
+            preds = model(x, t)
+            weighted_terms = []
+            horizons = min(preds.shape[0], ys.shape[0])
+            for k in range(horizons):
+                weight = float(per_horizon_weight[k].item()) / total_weight
+                if weight <= 0:
+                    continue
+                loss_k = loss_main(preds[k], ys[k])
+                stab_k = loss_stab(preds[k], ys[k])
+                weighted_terms.append(weight * (loss_k + stab_k))
+            if not weighted_terms:
                 continue
-            raw_loss = torch.stack(loss_terms).sum()
-            loss = raw_loss / accum_steps
+            loss = torch.stack(weighted_terms).sum()
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
         else:
             loss.backward()
-        should_step = ((step + 1) % accum_steps == 0) or (step + 1 == steps_per_epoch)
-        if should_step:
-            if scaler is not None and scaler.is_enabled():
-                scaler.unscale_(optimizer)
-                if clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                if clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
         with torch.no_grad():
-            total_loss += raw_loss.detach().item()
-            total_rho += spearman_rho(preds_list[0], batch.labels[0]).item()
+            total_loss += loss.item()
+            total_rho += spearman_rho(preds[0], ys[0]).item()
             steps += 1
     if steps == 0:
         return 0.0, 0.0
@@ -415,52 +354,46 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(
-    model,
-    loader,
-    loss_main,
-    loss_stab,
-    device,
-    amp_dtype,
-    amp_enabled,
-    prefetch_to_gpu,
-    return_daily: bool = False,
-):
+def evaluate(model, loader, loss_main, loss_stab, device, amp_dtype, amp_enabled, return_daily: bool = False):
     model.eval()
     total_loss = 0.0
     total_rho = 0.0
     steps = 0
     daily_rhos: list[float] = []
-    prefetch = bool(prefetch_to_gpu)
-    for batch in _iter_batches(loader, device, prefetch=prefetch):
-        counts_tensor = torch.stack([c.sum() for c in batch.counts]) if batch.counts else None
-        total_weight = float(counts_tensor.sum().item()) if counts_tensor is not None else 0.0
+    for x, t, ys, counts, batch_dates in loader:
+        x = x.to(device=device, non_blocking=True)
+        t = t.to(device=device, non_blocking=True)
+        ys = ys.to(device=device, non_blocking=True)
+        counts = counts.float()
+        per_horizon_weight = counts.sum(dim=-1)
+        total_weight = float(per_horizon_weight.sum().item())
         if total_weight <= 0:
             continue
-        weights = (counts_tensor / total_weight).detach()
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            preds_list = model(batch.features, batch.times)
+            preds = model(x, t)
         loss_val = 0.0
-        for idx, weight in enumerate(weights):
-            if idx >= len(preds_list) or idx >= len(batch.labels):
-                break
-            main_val = loss_main(preds_list[idx], batch.labels[idx]).item()
-            stab_val = loss_stab(preds_list[idx], batch.labels[idx]).item()
-            loss_val += float(weight.item()) * (main_val + stab_val)
+        horizons = min(preds.shape[0], ys.shape[0])
+        for k in range(horizons):
+            weight = float(per_horizon_weight[k].item()) / total_weight
+            if weight <= 0:
+                continue
+            loss_val += weight * (
+                loss_main(preds[k], ys[k]).item() + loss_stab(preds[k], ys[k]).item()
+            )
         total_loss += loss_val
-        preds = preds_list[0]
+        preds_h0 = preds[0]
         # compute per-day rho within这个 batch（完全向量化处理缺失值）
-        target = batch.labels[0]
+        target = ys[0]
         mask = ~torch.isnan(target)
         valid = mask.sum(dim=-1) >= 2
-        fill_value = torch.finfo(preds.dtype).min
-        preds_masked = torch.where(mask, preds, torch.full_like(preds, fill_value))
+        fill_value = torch.finfo(preds_h0.dtype).min
+        preds_masked = torch.where(mask, preds_h0, torch.full_like(preds_h0, fill_value))
         target_masked = torch.where(mask, target, torch.full_like(target, fill_value))
         rank_preds = torch.argsort(torch.argsort(preds_masked, dim=-1), dim=-1).float()
         rank_target = torch.argsort(torch.argsort(target_masked, dim=-1), dim=-1).float()
         rank_preds = torch.where(mask, rank_preds, torch.zeros_like(rank_preds))
         rank_target = torch.where(mask, rank_target, torch.zeros_like(rank_target))
-        mask_f = mask.to(preds.dtype)
+        mask_f = mask.to(preds_h0.dtype)
         valid_counts = mask.sum(dim=-1).clamp_min(1).float()
         mean_p = (rank_preds * mask_f).sum(dim=-1, keepdim=True) / valid_counts
         mean_t = (rank_target * mask_f).sum(dim=-1, keepdim=True) / valid_counts
@@ -504,16 +437,10 @@ def main():
     amp_dtype = _resolve_amp_dtype(cfg.train.get("amp_dtype", "auto"))
     amp_enabled = bool(cfg.train.amp) and device.type == "cuda"
 
-    dataset, _ = build_datasets(cfg)
-    max_train_dates = cfg.cv.get("max_train_dates")
-    if max_train_dates is not None:
-        max_train_dates = int(max_train_dates)
-        if max_train_dates > 0 and dataset.indices.numel() > max_train_dates:
-            keep = torch.arange(dataset.indices.numel() - max_train_dates, dataset.indices.numel())
-            dataset = dataset.view(keep.tolist())
+    dataset, date_list = build_datasets(cfg)
 
-    active_indices = dataset.indices.to(torch.long)
-    active_dates = dataset.dates.index_select(0, active_indices).tolist()
+    def subset(ds: TargetsWindowDataset, idxs):
+        return ds.view(idxs)
 
     ckpt_dir = Path(cfg.train.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -523,36 +450,27 @@ def main():
     all_snapshots: list[Path] = []
     best_global_score = -1e9
     best_global_path: Path | None = None
-    seed = int(cfg.seed)
     train_loader_cfg = _resolve_loader_options(cfg, "train")
     eval_loader_cfg = _resolve_loader_options(cfg, "eval")
-    default_prefetch = cfg.train.get("prefetch_to_gpu", device.type == "cuda")
-    default_prefetch = bool(device.type == "cuda") if default_prefetch is None else bool(default_prefetch)
-    prefetch_train = bool(train_loader_cfg.get("prefetch_to_gpu", default_prefetch))
-    prefetch_eval = bool(eval_loader_cfg.get("prefetch_to_gpu", prefetch_train))
-    grad_accum_steps = int(cfg.train.get("grad_accum", 1))
-    grad_clip_cfg = cfg.train.get("grad_clip_norm", 0.0)
-    grad_clip_norm = float(grad_clip_cfg) if grad_clip_cfg is not None else 0.0
+    if not eval_loader_cfg:
+        eval_loader_cfg = dict(train_loader_cfg)
 
     if use_cpcv:
         # CPCV outer loop
+        dates = dataset.dates.tolist()
         from camht.cpcv import CPCVSpec, cpcv_splits
 
         spec = CPCVSpec(n_splits=int(cfg.cv.n_splits), embargo_days=int(cfg.cv.embargo_days))
-        for fold_id, (tr_idx, te_idx) in enumerate(cpcv_splits(active_dates, spec)):
+        for fold_id, (tr_idx, te_idx) in enumerate(cpcv_splits(dates, spec)):
             train_loader = _build_loader(
-                dataset,
-                tr_idx.tolist(),
+                subset(dataset, tr_idx),
+                device,
                 loader_cfg=train_loader_cfg,
-                seed=seed,
-                device=device,
             )
             val_loader = _build_loader(
-                dataset,
-                te_idx.tolist(),
+                subset(dataset, te_idx),
+                device,
                 loader_cfg=eval_loader_cfg,
-                seed=seed,
-                device=device,
             )
 
             model = CAMHT(
@@ -581,7 +499,12 @@ def main():
                     console.print("[green]Loaded TiMAE encoder weights")
                 except Exception as e:  # noqa: BLE001
                     console.print(f"[yellow]Pretrain load failed: {e}")
-            opt = optim.AdamW(model.parameters(), lr=cfg.train.lr_max, weight_decay=cfg.train.weight_decay)
+            opt = _make_optimizer(
+                model,
+                lr=cfg.train.lr_max,
+                weight_decay=cfg.train.weight_decay,
+                device=device,
+            )
             scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
             loss_main = DiffSpearmanLoss(cfg.loss.diffsort_temperature, cfg.loss.diffsort_regularization)
             loss_stab = StabilityRegularizer(cfg.loss.stability_lambda)
@@ -605,21 +528,8 @@ def main():
                     cfg.train.warmup_pct,
                     amp_dtype,
                     amp_enabled,
-                    grad_accum_steps,
-                    grad_clip_norm,
-                    prefetch_train,
                 )
-                val_loss, val_rho, daily = evaluate(
-                    model,
-                    val_loader,
-                    loss_main,
-                    loss_stab,
-                    device,
-                    amp_dtype,
-                    amp_enabled,
-                    prefetch_eval,
-                    return_daily=True,
-                )
+                val_loss, val_rho, daily = evaluate(model, val_loader, loss_main, loss_stab, device, amp_dtype, amp_enabled, return_daily=True)
                 mean = float(np.mean(daily)) if len(daily) else 0.0
                 std = float(np.std(daily) + 1e-6)
                 sharpe_like = mean / std if std > 0 else 0.0
@@ -654,23 +564,19 @@ def main():
             shutil.copy2(best_global_path, final_path)
     else:
         # Simple holdout
-        n = dataset.indices.numel()
+        n = dataset.dates.numel()
         val_cut = int(n * (1 - cfg.cv.test_size_fraction))
         train_dates_idx = list(range(0, val_cut))
         val_dates_idx = list(range(val_cut, n))
         train_loader = _build_loader(
-            dataset,
-            train_dates_idx,
+            subset(dataset, train_dates_idx),
+            device,
             loader_cfg=train_loader_cfg,
-            seed=seed,
-            device=device,
         )
         val_loader = _build_loader(
-            dataset,
-            val_dates_idx,
+            subset(dataset, val_dates_idx),
+            device,
             loader_cfg=eval_loader_cfg,
-            seed=seed,
-            device=device,
         )
 
         model = CAMHT(
@@ -698,7 +604,12 @@ def main():
                 console.print("[green]Loaded TiMAE encoder weights")
             except Exception as e:  # noqa: BLE001
                 console.print(f"[yellow]Pretrain load failed: {e}")
-        opt = optim.AdamW(model.parameters(), lr=cfg.train.lr_max, weight_decay=cfg.train.weight_decay)
+        opt = _make_optimizer(
+            model,
+            lr=cfg.train.lr_max,
+            weight_decay=cfg.train.weight_decay,
+            device=device,
+        )
         scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
         loss_main = DiffSpearmanLoss(cfg.loss.diffsort_temperature, cfg.loss.diffsort_regularization)
         loss_stab = StabilityRegularizer(cfg.loss.stability_lambda)
@@ -721,21 +632,8 @@ def main():
                 cfg.train.warmup_pct,
                 amp_dtype,
                 amp_enabled,
-                grad_accum_steps,
-                grad_clip_norm,
-                prefetch_train,
             )
-            val_loss, val_rho, daily = evaluate(
-                model,
-                val_loader,
-                loss_main,
-                loss_stab,
-                device,
-                amp_dtype,
-                amp_enabled,
-                prefetch_eval,
-                return_daily=True,
-            )
+            val_loss, val_rho, daily = evaluate(model, val_loader, loss_main, loss_stab, device, amp_dtype, amp_enabled, return_daily=True)
             mean = float(np.mean(daily)) if len(daily) else 0.0
             std = float(np.std(daily) + 1e-6)
             sharpe_like = mean / std if std > 0 else 0.0

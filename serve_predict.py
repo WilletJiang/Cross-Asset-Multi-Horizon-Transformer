@@ -66,8 +66,8 @@ def predict_endpoint(model: CAMHT, test_hist: pl.DataFrame, label_lag_1: pl.Data
         preds = model(
             latest.unsqueeze(0).unsqueeze(-1).to(device),
             times.to(device),
-        )  # list of 4 [1, A]
-        preds = [p.squeeze(0).float().cpu().numpy() for p in preds]
+        )  # [H, 1, A]
+        preds = preds[:, 0].float().cpu().numpy()
     # Day-level standardization (stabilize ranks)
     preds = [((p - p.mean()) / (p.std() + 1e-8)) for p in preds]
     # optional tanh clip for stability
