@@ -42,15 +42,14 @@ train:
   use_pretrain: true
   pretrain_ckpt: checkpoints/timae_encoder.ckpt
   amp_dtype: auto  # auto => bf16(支持时) / 否则 fp16
-  train_loader:
-    num_workers: 8
-    pin_memory: true
-    persistent_workers: true
-    prefetch_factor: 4
-    pin_memory_device: cuda
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  pin_memory_device: cuda
+  prefetch_to_gpu: true
   eval_loader:
     num_workers: 4
-    pin_memory: true
     persistent_workers: true
 
 loss:
