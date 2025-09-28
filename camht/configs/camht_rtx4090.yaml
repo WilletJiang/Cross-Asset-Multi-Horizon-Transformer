@@ -1,0 +1,85 @@
+seed: 1337
+
+data:
+  train_csv: data/train.csv
+  labels_csv: data/train_labels.csv
+  test_csv: data/test.csv
+  target_pairs_csv: data/target_pairs.csv
+  date_column: date_id
+  window: 576  # 24GB RTX 4090，适度加长时间窗但仍可稳定编译
+  patch_len: 16
+  patch_stride: 8
+  features: null
+  channels_first: false
+  normalize_per_day: true
+  winsorize_p: 0.003
+
+model:
+  d_model: 704
+  n_heads: 11
+  dropout: 0.1
+  n_layers_intra: 11
+  n_layers_cross: 5
+  activation: gelu
+  time2vec_dim: 8
+  use_flash_attn: true
+  use_compile: true
+  cross_group_size: 12
+
+train:
+  epochs: 36
+  batch_days: 14
+  grad_accum: 1
+  lr_max: 0.0013
+  weight_decay: 0.05
+  warmup_pct: 0.1
+  amp: true
+  grad_clip_norm: 0.9
+  checkpoint_dir: checkpoints/rtx4090
+  save_every: 1
+  early_stop_patience: 6
+  grad_checkpointing: true
+  use_pretrain: true
+  pretrain_ckpt: checkpoints/timae_encoder.ckpt
+  amp_dtype: auto
+  train_loader:
+    num_workers: 10
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 6
+    pin_memory_device: cuda
+  eval_loader:
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+
+loss:
+  diffsort_temperature: 0.09
+  diffsort_regularization: none
+  stability_lambda: 0.22
+
+cv:
+  n_splits: 5
+  embargo_days: 4
+  test_size_fraction: 0.2
+  max_train_dates: null
+  use_cpcv: true
+
+inference:
+  snapshot: checkpoints/rtx4090/best.ckpt
+  tanh_clip: 0.0
+
+pretrain:
+  epochs: 12
+  lr: 0.001
+  weight_decay: 0.05
+  mask_ratio: 0.5
+  batch_days: 16
+  window: 576
+  patch_len: 16
+  patch_stride: 8
+  time2vec_dim: 8
+
+logging:
+  log_dir: runs/camht_rtx4090
+  csv_log: runs/metrics_rtx4090.csv
