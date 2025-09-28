@@ -266,17 +266,59 @@ def _make_worker_init_fn(seed: int):
     return _init
 
 
+def _normalize_loader_section(section: object) -> Dict[str, object]:
+    if section is None:
+        return {}
+    if isinstance(section, dict):
+        return dict(section)
+    if OmegaConf.is_config(section):
+        resolved = OmegaConf.to_container(section, resolve=True)
+        if isinstance(resolved, dict):
+            return resolved
+    raise TypeError(f"Unsupported loader configuration type: {type(section)!r}")
+
+
+def _resolve_loader_options(cfg, role: str) -> Dict[str, object]:
+    keys = (
+        "num_workers",
+        "pin_memory",
+        "persistent_workers",
+        "prefetch_factor",
+        "pin_memory_device",
+        "prefetch_to_gpu",
+    )
+    options: Dict[str, object] = {}
+    for key in keys:
+        if cfg.train.get(key, None) is not None:
+            options[key] = cfg.train.get(key)
+    section_key = f"{role}_loader"
+    section = cfg.train.get(section_key, None)
+    try:
+        options.update(_normalize_loader_section(section))
+    except TypeError:
+        if section is not None:
+            console.print(
+                f"[yellow]Ignoring unsupported config for {section_key}: {type(section)!r}"
+            )
+    return options
+
+
 def _build_loader(
     dataset: TargetsWindowDataset,
     indices: Optional[Sequence[int]],
-    cfg,
+    *,
+    loader_cfg: Dict[str, object],
+    seed: int,
     device: torch.device,
 ) -> DataLoader:
     subset = dataset if indices is None else dataset.view(indices)
-    num_workers = int(cfg.train.get("num_workers", 0))
-    pin_memory = bool(cfg.train.get("pin_memory", True)) and device.type == "cuda"
-    persistent = bool(cfg.train.get("persistent_workers", False)) and num_workers > 0
-    prefetch_factor = cfg.train.get("prefetch_factor")
+    num_workers = int(loader_cfg.get("num_workers", 0) or 0)
+    pin_memory_default = device.type == "cuda"
+    pin_memory = bool(loader_cfg.get("pin_memory", pin_memory_default)) and device.type == "cuda"
+    persistent_default = num_workers > 0
+    persistent = bool(loader_cfg.get("persistent_workers", persistent_default)) and num_workers > 0
+    prefetch_factor = loader_cfg.get("prefetch_factor")
+    pin_memory_device = loader_cfg.get("pin_memory_device")
     loader_kwargs: Dict[str, object] = {
         "batch_size": None,
         "shuffle": False,
@@ -288,7 +330,9 @@ def _build_loader(
             loader_kwargs["persistent_workers"] = True
         if prefetch_factor is not None:
             loader_kwargs["prefetch_factor"] = int(prefetch_factor)
-        loader_kwargs["worker_init_fn"] = _make_worker_init_fn(int(cfg.seed))
+        loader_kwargs["worker_init_fn"] = _make_worker_init_fn(int(seed))
+    if pin_memory and pin_memory_device:
+        loader_kwargs["pin_memory_device"] = str(pin_memory_device)
     return DataLoader(subset, **loader_kwargs)  # type: ignore[arg-type]
 
 
@@ -479,7 +523,13 @@ def main():
     all_snapshots: list[Path] = []
     best_global_score = -1e9
     best_global_path: Path | None = None
-    prefetch_to_gpu = bool(cfg.train.get("prefetch_to_gpu", device.type == "cuda"))
+    seed = int(cfg.seed)
+    train_loader_cfg = _resolve_loader_options(cfg, "train")
+    eval_loader_cfg = _resolve_loader_options(cfg, "eval")
+    default_prefetch = cfg.train.get("prefetch_to_gpu", device.type == "cuda")
+    default_prefetch = bool(device.type == "cuda") if default_prefetch is None else bool(default_prefetch)
+    prefetch_train = bool(train_loader_cfg.get("prefetch_to_gpu", default_prefetch))
+    prefetch_eval = bool(eval_loader_cfg.get("prefetch_to_gpu", prefetch_train))
     grad_accum_steps = int(cfg.train.get("grad_accum", 1))
     grad_clip_cfg = cfg.train.get("grad_clip_norm", 0.0)
     grad_clip_norm = float(grad_clip_cfg) if grad_clip_cfg is not None else 0.0
@@ -490,8 +540,20 @@ def main():
 
         spec = CPCVSpec(n_splits=int(cfg.cv.n_splits), embargo_days=int(cfg.cv.embargo_days))
         for fold_id, (tr_idx, te_idx) in enumerate(cpcv_splits(active_dates, spec)):
-            train_loader = _build_loader(dataset, tr_idx.tolist(), cfg, device)
-            val_loader = _build_loader(dataset, te_idx.tolist(), cfg, device)
+            train_loader = _build_loader(
+                dataset,
+                tr_idx.tolist(),
+                loader_cfg=train_loader_cfg,
+                seed=seed,
+                device=device,
+            )
+            val_loader = _build_loader(
+                dataset,
+                te_idx.tolist(),
+                loader_cfg=eval_loader_cfg,
+                seed=seed,
+                device=device,
+            )
 
             model = CAMHT(
                 in_channels=1,
@@ -545,7 +607,7 @@ def main():
                     amp_enabled,
                     grad_accum_steps,
                     grad_clip_norm,
-                    prefetch_to_gpu,
+                    prefetch_train,
                 )
                 val_loss, val_rho, daily = evaluate(
                     model,
@@ -555,7 +617,7 @@ def main():
                     device,
                     amp_dtype,
                     amp_enabled,
-                    prefetch_to_gpu,
+                    prefetch_eval,
                     return_daily=True,
                 )
                 mean = float(np.mean(daily)) if len(daily) else 0.0
@@ -596,8 +658,20 @@ def main():
         val_cut = int(n * (1 - cfg.cv.test_size_fraction))
         train_dates_idx = list(range(0, val_cut))
         val_dates_idx = list(range(val_cut, n))
-        train_loader = _build_loader(dataset, train_dates_idx, cfg, device)
-        val_loader = _build_loader(dataset, val_dates_idx, cfg, device)
+        train_loader = _build_loader(
+            dataset,
+            train_dates_idx,
+            loader_cfg=train_loader_cfg,
+            seed=seed,
+            device=device,
+        )
+        val_loader = _build_loader(
+            dataset,
+            val_dates_idx,
+            loader_cfg=eval_loader_cfg,
+            seed=seed,
+            device=device,
+        )
 
         model = CAMHT(
             in_channels=1,
@@ -649,7 +723,7 @@ def main():
                 amp_enabled,
                 grad_accum_steps,
                 grad_clip_norm,
-                prefetch_to_gpu,
+                prefetch_train,
             )
             val_loss, val_rho, daily = evaluate(
                 model,
@@ -659,7 +733,7 @@ def main():
                 device,
                 amp_dtype,
                 amp_enabled,
-                prefetch_to_gpu,
+                prefetch_eval,
                 return_daily=True,
             )
             mean = float(np.mean(daily)) if len(daily) else 0.0
