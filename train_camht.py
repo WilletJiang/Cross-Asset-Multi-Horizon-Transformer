@@ -194,18 +194,76 @@ def _suggest_worker_count(device: torch.device) -> int:
     return max(1, cpu_count // 2)
 
 
-def _build_loader(dataset: TargetsWindowDataset, device: torch.device) -> DataLoader:
-    num_workers = _suggest_worker_count(device)
+def _normalize_loader_section(section: object) -> Dict[str, object]:
+    if section is None:
+        return {}
+    if isinstance(section, dict):
+        return dict(section)
+    if OmegaConf.is_config(section):
+        resolved = OmegaConf.to_container(section, resolve=True)
+        if isinstance(resolved, dict):
+            return resolved
+    raise TypeError(f"Unsupported loader configuration type: {type(section)!r}")
+
+
+def _resolve_loader_options(cfg, role: str) -> Dict[str, object]:
+    keys = (
+        "num_workers",
+        "pin_memory",
+        "persistent_workers",
+        "prefetch_factor",
+        "pin_memory_device",
+    )
+    options: Dict[str, object] = {}
+    for key in keys:
+        if cfg.train.get(key, None) is not None:
+            options[key] = cfg.train.get(key)
+    section_key = f"{role}_loader"
+    section = cfg.train.get(section_key, None)
+    try:
+        options.update(_normalize_loader_section(section))
+    except TypeError:
+        if section is not None:
+            console.print(
+                f"[yellow]Ignoring unsupported config for {section_key}: {type(section)!r}"
+            )
+    return options
+
+
+def _build_loader(
+    dataset: TargetsWindowDataset,
+    device: torch.device,
+    *,
+    loader_cfg: Dict[str, object],
+) -> DataLoader:
+    suggested_workers = _suggest_worker_count(device)
+    num_workers = loader_cfg.get("num_workers")
+    if num_workers is None:
+        num_workers = suggested_workers
+    num_workers = int(max(0, int(num_workers)))
+    pin_memory_default = device.type == "cuda"
+    pin_memory = bool(loader_cfg.get("pin_memory", pin_memory_default)) and device.type == "cuda"
+    persistent_default = num_workers > 0
+    persistent_workers = bool(loader_cfg.get("persistent_workers", persistent_default)) and num_workers > 0
+    prefetch_factor = loader_cfg.get("prefetch_factor")
+    if prefetch_factor is None and num_workers > 0:
+        prefetch_factor = 4
+    pin_memory_device = loader_cfg.get("pin_memory_device")
+
     loader_kwargs: Dict[str, object] = {
         "batch_size": 1,
         "shuffle": False,
         "num_workers": num_workers,
-        "pin_memory": device.type == "cuda",
+        "pin_memory": pin_memory,
         "collate_fn": _passthrough_collate,
     }
     if num_workers > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 4
+        if persistent_workers:
+            loader_kwargs["persistent_workers"] = True
+        if prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = int(prefetch_factor)
+    if pin_memory and pin_memory_device:
+        loader_kwargs["pin_memory_device"] = str(pin_memory_device)
     return DataLoader(dataset, **loader_kwargs)
 
 
@@ -217,7 +275,7 @@ def _make_optimizer(model: nn.Module, *, lr: float, weight_decay: float, device:
             index = device.index if device.index is not None else torch.cuda.current_device()
             major, _ = torch.cuda.get_device_capability(index)
             fused_ok = major >= 8
-        except RuntimeError:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             fused_ok = False
     if fused_ok:
         extra["fused"] = True
@@ -326,7 +384,7 @@ def evaluate(model, loader, loss_main, loss_stab, device, amp_dtype, amp_enabled
         preds_h0 = preds[0]
         # compute per-day rho within这个 batch（完全向量化处理缺失值）
         target = ys[0]
-        mask = (~torch.isnan(target)) & (~torch.isnan(preds_h0))
+        mask = ~torch.isnan(target)
         valid = mask.sum(dim=-1) >= 2
         fill_value = torch.finfo(preds_h0.dtype).min
         preds_masked = torch.where(mask, preds_h0, torch.full_like(preds_h0, fill_value))
@@ -392,6 +450,10 @@ def main():
     all_snapshots: list[Path] = []
     best_global_score = -1e9
     best_global_path: Path | None = None
+    train_loader_cfg = _resolve_loader_options(cfg, "train")
+    eval_loader_cfg = _resolve_loader_options(cfg, "eval")
+    if not eval_loader_cfg:
+        eval_loader_cfg = dict(train_loader_cfg)
 
     if use_cpcv:
         # CPCV outer loop
@@ -400,8 +462,16 @@ def main():
 
         spec = CPCVSpec(n_splits=int(cfg.cv.n_splits), embargo_days=int(cfg.cv.embargo_days))
         for fold_id, (tr_idx, te_idx) in enumerate(cpcv_splits(dates, spec)):
-            train_loader = _build_loader(subset(dataset, tr_idx), device)
-            val_loader = _build_loader(subset(dataset, te_idx), device)
+            train_loader = _build_loader(
+                subset(dataset, tr_idx),
+                device,
+                loader_cfg=train_loader_cfg,
+            )
+            val_loader = _build_loader(
+                subset(dataset, te_idx),
+                device,
+                loader_cfg=eval_loader_cfg,
+            )
 
             model = CAMHT(
                 in_channels=1,
@@ -498,8 +568,16 @@ def main():
         val_cut = int(n * (1 - cfg.cv.test_size_fraction))
         train_dates_idx = list(range(0, val_cut))
         val_dates_idx = list(range(val_cut, n))
-        train_loader = _build_loader(subset(dataset, train_dates_idx), device)
-        val_loader = _build_loader(subset(dataset, val_dates_idx), device)
+        train_loader = _build_loader(
+            subset(dataset, train_dates_idx),
+            device,
+            loader_cfg=train_loader_cfg,
+        )
+        val_loader = _build_loader(
+            subset(dataset, val_dates_idx),
+            device,
+            loader_cfg=eval_loader_cfg,
+        )
 
         model = CAMHT(
             in_channels=1,

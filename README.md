@@ -51,7 +51,9 @@ CAMHT：Cross-Asset Multi‑Horizon Transformer（竞赛级实现）
 2) 监督训练（CPCV + Sharpe-like 早停）
 - 直接对齐比赛目标：可微 Spearman 主损失 + 稳定性正则（降低日度波动）。
 - 命令：
-  - `python train_camht.py --cfg camht/configs/camht.yaml`
+- `python train_camht.py --cfg camht/configs/camht.yaml`
+- 针对 RTX 5090 32G 进行了专门调优，可直接使用 `python train_camht.py --cfg camht/configs/camht_rtx5090.yaml`
+- DataLoader 通过 `train.train_loader`/`train.eval_loader` 节点配置（工作线程、pin memory、prefetch），可按机器带宽灵活调节。
 - 结果：
   - 每折最佳：`checkpoints/best_fold_{k}.ckpt`
   - 全局最佳（用于 serve）：`checkpoints/best.ckpt`
