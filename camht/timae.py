@@ -55,6 +55,18 @@ class TiMAE(nn.Module):
             recon: [B, A, N, P*C]
             mask:  [B, A, N] boolean mask where True = was masked
         """
+        if x.ndim == 3:
+            x = x.unsqueeze(-1)
+        if times.ndim == 3:
+            times = times.unsqueeze(-1)
+
+        if x.ndim != 4:
+            raise ValueError(f"Expected x to be 4D [B, A, T, C], got {x.shape}")
+        if times.ndim != 4:
+            raise ValueError(f"Expected times to be 4D [B, A, T, 1], got {times.shape}")
+        if x.shape[:3] != times.shape[:3]:
+            raise ValueError(f"Mismatched shapes: x {x.shape} vs times {times.shape}")
+
         B, A, T, C = x.shape
         xa = rearrange(x, "B A T C -> (B A) T C")
         ta = rearrange(times, "B A T C -> (B A) T C")

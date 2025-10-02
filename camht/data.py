@@ -137,7 +137,8 @@ class DailyRollingDataset(Dataset):
                 w = np.apply_along_axis(lambda a: winsorize(a, self.winsorize_p), 0, w)
             feats.append(w[-self.spec.window :])
         x = np.stack(feats, axis=0)  # [A, T, C]
-        times = np.linspace(0, 1, x.shape[1], dtype=np.float32)[None, :, None].repeat(x.shape[0], axis=0)
+        times = np.linspace(0, 1, x.shape[1], dtype=np.float32)[None, :, None]
+        times = np.repeat(times, x.shape[0], axis=0)
 
         # labels for this date
         y = self._label_groups.get_group(date).select(self.target_cols).to_numpy()

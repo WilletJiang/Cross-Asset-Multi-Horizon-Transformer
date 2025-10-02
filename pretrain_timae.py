@@ -54,7 +54,12 @@ def main():
     defs = parse_target_pairs(cfg.data.target_pairs_csv)
     series_df, order = compute_target_matrix(train, cfg.data.date_column, defs)
     ds = SeriesDataset(series_df, cfg.data.date_column, cfg.pretrain.window, cfg.pretrain.batch_days)
-    loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
+    def _collate(batch):
+        if len(batch) != 1:
+            raise ValueError("SeriesDataset expects batch_size=1")
+        return batch[0]
+
+    loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=_collate)
 
     model = TiMAE(
         in_channels=1,
