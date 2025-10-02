@@ -6,7 +6,7 @@ data:
   test_csv: data/test.csv
   target_pairs_csv: data/target_pairs.csv
   date_column: date_id
-  window: 608  # 24GB RTX 4090, 向上探索更长上下文
+  window: 640  # 双卡有效批量更大，可视情况再增
   patch_len: 16
   patch_stride: 8
   features: null
@@ -15,55 +15,72 @@ data:
   winsorize_p: 0.003
 
 model:
-  d_model: 736
+  d_model: 768  # Slightly larger model for multi-GPU
   n_heads: 12
-  dropout: 0.08
+  dropout: 0.1
   n_layers_intra: 12
-  n_layers_cross: 5
+  n_layers_cross: 6
   activation: gelu
   time2vec_dim: 8
   time2vec_activation: sin
   time2vec_include_linear: true
   time2vec_freq_init: harmonic
-  time2vec_freq_range: [8.0, 512.0]
+  time2vec_freq_range: [4.0, 640.0]
   use_flash_attn: true
   use_compile: true
-  cross_group_size: 12
+  cross_group_size: 16
 
 train:
-  epochs: 40
-  batch_days: 16             # 24G 单卡极限批量，配合 grad_accum=1
-  grad_accum: 1
-  lr_max: 0.0012
+  epochs: 36
+  batch_days: 12            # 每 GPU 12 天，总等效 24
+  grad_accum: 2             # 配合两卡得到 48 天有效批量
+  lr_max: 0.0013
   weight_decay: 0.05
-  warmup_pct: 0.1
+  warmup_pct: 0.12
   amp: true
   amp_dtype: auto
   grad_clip_norm: 1.0
-  checkpoint_dir: checkpoints/rtx4090
+  checkpoint_dir: checkpoints/multi_gpu
   save_every: 1
-  early_stop_patience: 6
+  early_stop_patience: 8
   grad_checkpointing: true
   use_pretrain: true
   pretrain_ckpt: checkpoints/timae_encoder.ckpt
   compile_mode: max-autotune
   compile_fullgraph: false
   compile_dynamic: false
+
+  # Distributed training开关
+  distributed:
+    enabled: true
+    backend: nccl
+    mixed_precision: true
+    broadcast_buffers: false
+    find_unused_parameters: false
+    static_graph: true
+    sync_bn: false
+    gradient_as_bucket_view: true
+
+  use_fsdp: false
+  fsdp_sharding_strategy: FULL_SHARD
+
+  # DataLoader
   train_loader:
     num_workers: 12
     pin_memory: true
     persistent_workers: true
-    prefetch_factor: 6
+    prefetch_factor: 8
     pin_memory_device: cuda
   eval_loader:
     num_workers: 6
     pin_memory: true
     persistent_workers: true
+    prefetch_factor: 4
 
 loss:
-  diffsort_temperature: 0.085
+  diffsort_temperature: 0.09
   diffsort_regularization: none
-  stability_lambda: 0.2
+  stability_lambda: 0.22
 
 cv:
   n_splits: 5
@@ -73,20 +90,28 @@ cv:
   use_cpcv: true
 
 inference:
-  snapshot: checkpoints/rtx4090/best.ckpt
+  snapshot: checkpoints/multi_gpu/best.ckpt
   tanh_clip: 0.0
 
 pretrain:
-  epochs: 12
-  lr: 0.001
+  epochs: 16
+  lr: 0.0012
   weight_decay: 0.05
   mask_ratio: 0.5
-  batch_days: 18
-  window: 608
+  batch_days: 24
+  window: 640
   patch_len: 16
   patch_stride: 8
   time2vec_dim: 8
 
 logging:
-  log_dir: runs/camht_rtx4090
-  csv_log: runs/metrics_rtx4090.csv
+  log_dir: runs/camht_multi_gpu
+  csv_log: runs/metrics_multi_gpu.csv
+
+# Performance monitoring
+profiling:
+  enabled: false  # Enable for detailed profiling
+  output_dir: profiler_logs
+  profile_memory: true
+  record_shapes: true
+

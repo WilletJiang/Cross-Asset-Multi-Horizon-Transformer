@@ -156,6 +156,12 @@ class DailyRollingDataset(Dataset):
         xs, ts, ys = [], [], []
         for d in batch_dates:
             x, t, y = self._per_day_tensor(d)
+            if not torch.isfinite(x).all():
+                x = torch.nan_to_num(x, nan=0.0)
+            if not torch.isfinite(t).all():
+                t = torch.nan_to_num(t, nan=0.0)
+            if not torch.isfinite(y).all():
+                y = torch.nan_to_num(y, nan=0.0)
             xs.append(x)
             ts.append(t)
             ys.append(y)

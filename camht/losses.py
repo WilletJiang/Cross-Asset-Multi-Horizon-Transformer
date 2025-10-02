@@ -84,6 +84,7 @@ class DiffSpearmanLoss(nn.Module):
         var_t = (xt.pow(2).sum(dim=-1) / safe_counts).clamp_min(eps)
         rho = cov / (var_p.sqrt() * var_t.sqrt() + eps)
         rho = torch.where(valid_rows, rho, torch.zeros_like(rho))
+        rho = torch.nan_to_num(rho, nan=0.0, posinf=0.0, neginf=0.0)
 
         if row_weights is not None:
             weights = row_weights.to(device=preds.device, dtype=preds.dtype)

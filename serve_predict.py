@@ -15,7 +15,7 @@ from kaggle_evaluation.core.templates import InferenceServer
 from camht.data import build_normalized_windows
 from camht.model import CAMHT
 from camht.targets import compute_target_matrix, parse_target_pairs
-from camht.utils import SDPPolicy, configure_sdp, get_device
+from camht.utils import SDPPolicy, configure_sdp, get_device, resolve_time2vec_kwargs
 
 
 def build_model(snapshot: str, device: torch.device) -> CAMHT:
@@ -29,6 +29,12 @@ def build_model(snapshot: str, device: torch.device) -> CAMHT:
         patch_len=16,
         patch_stride=8,
         time2vec_dim=8,
+        time2vec_kwargs=resolve_time2vec_kwargs({
+            "time2vec_activation": os.getenv("CAMHT_TIME2VEC_ACT", "sin"),
+            "time2vec_include_linear": os.getenv("CAMHT_TIME2VEC_LINEAR", "1") not in {"0", "false", "False"},
+            "time2vec_freq_init": os.getenv("CAMHT_TIME2VEC_INIT", "harmonic"),
+            "time2vec_freq_range": os.getenv("CAMHT_TIME2VEC_RANGE", "16,512"),
+        }),
         use_flash_attn=True,
         grad_checkpointing=False,
         cross_group_size=group_size,

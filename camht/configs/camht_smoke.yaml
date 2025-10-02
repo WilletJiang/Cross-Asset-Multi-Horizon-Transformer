@@ -1,0 +1,85 @@
+seed: 1337
+
+data:
+  train_csv: data/train.csv
+  labels_csv: data/train_labels.csv
+  test_csv: data/test.csv
+  target_pairs_csv: data/target_pairs.csv
+  date_column: date_id
+  window: 128
+  patch_len: 16
+  patch_stride: 16
+  features: null
+  channels_first: false
+  normalize_per_day: true
+  winsorize_p: 0.01
+
+model:
+  d_model: 128
+  n_heads: 4
+  dropout: 0.0
+  n_layers_intra: 2
+  n_layers_cross: 1
+  activation: gelu
+  time2vec_dim: 4
+  time2vec_activation: sin
+  time2vec_include_linear: true
+  time2vec_freq_init: harmonic
+  time2vec_freq_range: [8.0, 64.0]
+  use_flash_attn: false
+  use_compile: false
+  cross_group_size: 0
+
+train:
+  epochs: 1
+  batch_days: 2
+  grad_accum: 1
+  lr_max: 0.001
+  weight_decay: 0.01
+  warmup_pct: 0.1
+  amp: false
+  grad_clip_norm: 1.0
+  checkpoint_dir: checkpoints/smoke
+  save_every: 1
+  early_stop_patience: 1
+  grad_checkpointing: false
+  use_pretrain: false
+  pretrain_ckpt: checkpoints/timae_encoder.ckpt
+  amp_dtype: auto
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: null
+  pin_memory_device: null
+
+loss:
+  diffsort_temperature: 0.1
+  diffsort_regularization: none
+  stability_lambda: 0.1
+
+cv:
+  n_splits: 2
+  embargo_days: 1
+  test_size_fraction: 0.2
+  max_train_dates: 64
+  use_cpcv: false
+
+inference:
+  snapshot: checkpoints/smoke/best.ckpt
+  tanh_clip: 0.0
+
+pretrain:
+  epochs: 2
+  lr: 0.001
+  weight_decay: 0.01
+  mask_ratio: 0.4
+  batch_days: 2
+  window: 128
+  patch_len: 16
+  patch_stride: 16
+  time2vec_dim: 4
+
+logging:
+  log_dir: runs/camht_smoke
+  csv_log: runs/metrics_smoke.csv
+
